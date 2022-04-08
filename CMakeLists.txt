@@ -72,6 +72,10 @@ target_include_directories(
 
 install_dll(${LibArchive_LIBRARIES})
 
+test_libs(archive)
+
+set_tests_properties(archive:archive PROPERTIES ENVIRONMENT "ARCHIVE_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}")
+
 pkg_doc(archive
 	SOURCE archive.pl archive4pl.tex
 	DEPENDS archive)

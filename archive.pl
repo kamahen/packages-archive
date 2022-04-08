@@ -189,9 +189,9 @@ archive_open(File, Mode, Archive, Options) :-
 %
 %     ==
 %     archive_open_named(ArchiveFile, EntryName, Stream) :-
-%         archive_open(ArchiveFile, Handle, []),
-%         archive_next_header(Handle, Name),
-%         archive_open_entry(Handle, Stream),
+%         archive_open(ArchiveFile, Archive, []),
+%         archive_next_header(Archive, EntryName),
+%         archive_open_entry(Archive, Stream),
 %         archive_close(Archive).
 %     ==
 
@@ -216,7 +216,7 @@ defined_archive_property(filter(_)).
 %!  archive_next_header(+Handle, -Name) is semidet.
 %
 %   Forward to the next entry of the  archive for which Name unifies
-%   with the pathname of the entry. Fails   silently  if the name of
+%   with the pathname of the entry. Fails   silently  if the end  of
 %   the  archive  is  reached  before  success.  Name  is  typically
 %   specified if a  single  entry  must   be  accessed  and  unbound
 %   otherwise. The following example opens  a   Prolog  stream  to a
@@ -225,10 +225,10 @@ defined_archive_property(filter(_)).
 %   after the data has been used.   See also setup_call_cleanup/3.
 %
 %     ==
-%     open_archive_entry(ArchiveFile, Entry, Stream) :-
+%     open_archive_entry(ArchiveFile, EntryName, Stream) :-
 %         open(ArchiveFile, read, In, [type(binary)]),
 %         archive_open(In, Archive, [close_parent(true)]),
-%         archive_next_header(Archive, Entry),
+%         archive_next_header(Archive, EntryName),
 %         archive_open_entry(Archive, Stream).
 %     ==
 %
