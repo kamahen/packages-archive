@@ -132,20 +132,21 @@ archive_open(Stream, Archive, Options) :-
 %!  archive_open(+Data, +Mode, -Archive, +Options) is det.
 %
 %   Open the  archive in  Data and  unify Archive with  a handle  to the
-%   opened archive.  Data is either a  file or a stream  that contains a
-%   valid  archive.  Mode  is  either `read`  or  `write`.  Details  are
-%   controlled by  Options. Typically, the option  close_parent(true) is
-%   used  to close  an  entry  stream if  the  archive  is closed  using
-%   archive_close/1.  For  other options when reading,  the defaults are
-%   typically fine  - for writing,  a valid format and  optional filters
-%   must be specified.   The option format(raw) must be  used to process
-%   compressed  streams  that do  not  contain  explicit entries  (e.g.,
-%   gzip'ed  data) unambibuously.   The =raw=  format creates  a _pseudo
-%   archive_ holding a single member named =data=.
+%   opened archive.  Data is either a  file name (as accepted by open/4)
+%   or a stream that contains a valid archive.  Mode is either `read` or
+%   `write`.  Details  are controlled by Options.  Typically, the option
+%   close_parent(true) is used  to close an entry stream  if the archive
+%   is closed  using archive_close/1.   For other options  when reading,
+%   the defaults  are typically fine -  for writing, a valid  format and
+%   optional filters must be specified.   The option format(raw) must be
+%   used  to process  compressed streams  that do  not contain  explicit
+%   entries  (e.g.,  gzip'ed  data)  unambibuously.   The  =raw=  format
+%   creates a _pseudo archive_ holding a single member named =data=.
 %
 %     * close_parent(+Boolean)
 %     If this option is =true=  (default =false=), Data stream is closed
-%     if archive_close/1 is called on Archive.
+%     if archive_close/1 is called on Archive. If Data is a file name,
+%     the default is =true=.
 %
 %     * compression(+Compression)
 %     Synomym for filter(Compression).  Deprecated.
@@ -154,7 +155,7 @@ archive_open(Stream, Archive, Options) :-
 %     Support the indicated filter. This option may be
 %     used multiple times to support multiple filters. In read mode,
 %     If no filter options are provided, =all= is assumed. In write
-%     mode, none is assumed.
+%     mode, =none= is assumed.
 %     Supported values are =all=, =bzip2=, =compress=, =gzip=,
 %     =grzip=, =lrzip=, =lzip=, =lzma=, =lzop=, =none=, =rpm=, =uu=
 %     and =xz=. The value =all= is default for read, =none= for write.
@@ -177,12 +178,11 @@ archive_open(Stream, Archive, Options) :-
 %   permission error if  the (explicitly) requested format  or filter is
 %   not supported.
 %
-%   @error  domain_error(filter, Filter) if the requested
-%           filter is invalid (e.g., `all` for writing).
-%   @error  domain_error(format, Format) if the requested
-%           format type is not supported.
-%   @error  permission_error(set, filter, Filter) if the requested
-%           filter is not supported.
+%   @error  domain_error if the Mode or an option isn't one of the possible values.
+%   @error  existence_permission_error if a format or filter isn't supported
+%           for the file.
+%   @error  existence_error if the format or filter isn't supported
+%           in general.
 
 archive_open(stream(Stream), Mode, Archive, Options) :-
     !,
@@ -259,6 +259,8 @@ defined_archive_property(filter(_)).
 %   Open the current entry as a stream. Stream must be closed.
 %   If the stream is not closed before the next call to
 %   archive_next_header/2, a permission error is raised.
+%
+%   @error permission_error if the Archive isn't in an appropriate state.
 
 
 %!  archive_set_header_property(+Archive, +Property)
@@ -278,6 +280,8 @@ defined_archive_property(filter(_)).
 %     * link_target(-Target)
 %     Target for a link. Currently only supported for symbolic
 %     links.
+%
+%   @error permission_error if the Archive isn't in an appropriate state.
 
 %!  archive_header_property(+Archive, ?Property)
 %
@@ -302,6 +306,8 @@ defined_archive_property(filter(_)).
 %     of the output of archive_format_name().
 %     * permissions(-Integer)
 %     True when entry has the indicated permission mask.
+%
+%   @error permission_error if the Archive isn't in an appropriate state.
 
 archive_header_property(Archive, Property) :-
     (   nonvar(Property)
@@ -341,6 +347,7 @@ header_property(permissions(_)).
 %           or is not a directory.
 %   @error  domain_error(path_prefix(Prefix), Path) if a path in
 %           the archive does not start with Prefix
+%   @error permission_error if the Archive isn't in an appropriate state.
 %   @tbd    Add options
 
 archive_extract(Archive, Dir, Options) :-
