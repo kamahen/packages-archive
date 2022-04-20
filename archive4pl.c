@@ -77,8 +77,15 @@ typedef struct archive_wrapper
   int			closed_archive;	/* Archive was closed with open entry */
   struct archive *	archive;	/* Actual archive handle */
   struct archive_entry *entry;		/* Current entry */
-  int                   how;            /* r/w mode ('r' or 'w') */
+  int (*archive_free)(struct archive *); /* archive_read_free() or archive_write_free() */
+  int			how;		/* r/w mode ('r' or 'w') */
 } archive_wrapper;
+
+/* Initial value of archive_wrapper.archive_free: */
+static int
+archive_noop_free(struct archive * _a)
+{ return ARCHIVE_OK;
+}
 
 #if 0
 /* For debugging: */
@@ -171,21 +178,11 @@ int PL_existence_error3(const char* type, const char* object, term_t in)
 		 *	  SYMBOL WRAPPER	*
 		 *******************************/
 
-static int archive_free_handle(archive_wrapper *ar)
-{ int rc;
-  /* It's safe to pass NULL to archive_read_free(), archive_write_free() */
-  if ( ar->how == 'r' )
-    rc = archive_read_free(ar->archive);
-  else
-    rc = archive_write_free(ar->archive);
-  ar->archive = NULL;
-  return rc;
-}
-
 static void
 acquire_archive(atom_t symbol)
 { archive_wrapper *ar = PL_blob_data(symbol, NULL, NULL);
   ar->symbol = symbol;
+  assert(ar->archive_free);
 }
 
 
@@ -199,7 +196,10 @@ release_archive(atom_t symbol)
   /* assert(ar->status != AR_OPENED_ENTRY); */
 
   archive_entry_free(ar->entry); /* Safe even if !ar->entry */
-  archive_free_handle(ar);
+  ar->entry = NULL;
+  ar->archive_free(ar->archive);
+  ar->archive = NULL;
+  ar->archive_free = archive_noop_free;
 
   return TRUE;
 }
@@ -268,6 +268,7 @@ ar_open(struct archive *a, void *cdata)
 { return ARCHIVE_OK;
 }
 
+/* Callback from archive_XXX_close() or archive_XXX_free() */
 static int
 ar_close(struct archive *a, void *cdata)
 { archive_wrapper *ar = cdata;
@@ -493,6 +494,7 @@ archive_open_stream(term_t data, term_t mode, term_t handle, term_t options)
     atom_t a;
     memset(&ar_local, 0, sizeof ar_local);
     ar_local.magic = ARCHIVE_MAGIC;
+    ar_local.archive_free = archive_noop_free;
 
     if ( !PL_unify_blob(handle, &ar_local, sizeof ar_local, &archive_blob) ||
          !PL_get_atom_ex(handle, &a) )
@@ -508,9 +510,11 @@ archive_open_stream(term_t data, term_t mode, term_t handle, term_t options)
     { if ( mname == ATOM_write )
       { ar->how = 'w';
         flags = SIO_OUTPUT;
+        ar->archive_free = archive_write_free;
       } else if ( mname == ATOM_read )
       { ar->how = 'r';
         flags = SIO_INPUT;
+        ar->archive_free = archive_read_free;
       } else
       { return PL_domain_error("io_mode", mode);
       }
@@ -958,7 +962,7 @@ archive_close(term_t archive)
   { ar->closed_archive = TRUE;
 
     return TRUE;
-  } else if ( (rc=archive_free_handle(ar)) == ARCHIVE_OK )
+  } else if ( (rc=ar->archive_free(ar->archive)) == ARCHIVE_OK )
   { ar->entry = NULL;
     ar->archive = NULL;
     ar->symbol = 0;
@@ -974,7 +978,7 @@ archive_close(term_t archive)
 		 *******************************/
 
 static foreign_t
-archive_header_prop(term_t archive, term_t field)
+archive_header_prop_(term_t archive, term_t field)
 { archive_wrapper *ar;
   functor_t prop;
 
@@ -1162,7 +1166,7 @@ ar_close_entry(void *handle)
   { if ( ar->archive )
     { int rc;
 
-      if ( (rc=archive_free_handle(ar)) == ARCHIVE_OK )
+      if ( (rc=ar->archive_free(ar->archive)) == ARCHIVE_OK )
       { ar->entry = NULL;
 	ar->archive = NULL;
 	ar->symbol = 0;
@@ -1322,7 +1326,7 @@ install_archive4pl(void)
   PL_register_foreign("archive_property",     3, archive_property,    0);
   PL_register_foreign("archive_close",        1, archive_close,       0);
   PL_register_foreign("archive_next_header",  2, archive_next_header, 0);
-  PL_register_foreign("archive_header_prop_", 2, archive_header_prop, 0);
+  PL_register_foreign("archive_header_prop_", 2, archive_header_prop_, 0);
   PL_register_foreign("archive_set_header_property", 2, archive_set_header_property, 0);
   PL_register_foreign("archive_open_entry",   2, archive_open_entry,  0);
 }
