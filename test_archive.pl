@@ -156,6 +156,23 @@ test(bad_mode,
 
 :- end_tests(archive).
 
+:- begin_tests(debug). % TODO: Remove this once asan memory bugs have been fixed
+                       %       Also remove archive_open_named_debug/3.
+
+test(memleak) :-
+    set_prolog_flag(agc_margin,0), % turn off gc
+    set_prolog_flag(trace_gc, true),
+    ArchivePath= '/tmp/ar_test.zip', % requires setting up manually
+    (   archive_open_named_debug(ArchivePath, 'XXX', _TestArchiveStream)
+    *-> format(user_error, '*** memleak test - Should have failed!!!~n', [])
+    ;   format(user_error, '*** memleak test - about to garbage collect(1)~n', []),
+        garbage_collect_atoms,
+        format(user_error, '*** memleak test - about to garbage collect(2)~n', []),
+        garbage_collect_atoms
+    ).
+
+:- end_tests(debug).
+
 create_tmp_file(Path) :-
     tmp_file_stream(utf8, Path, Out),
     close(Out).
@@ -196,6 +213,19 @@ file_first_line(SrcDir, File, Line) :-
         open(Path, read, In),
         read_line_to_string(In, Line),
         close(In)).
+
+% TODO: delete this when debug test casesa are removed
+% (This is archive_open_named/3 with extra debug statements)
+archive_open_named_debug(ArchiveFile, EntryName, Stream) :-
+    format(user_error, '*** ~q~n', [archive_open_named_debug_1(ArchiveFile, EntryName, Stream)]),
+    archive_open(ArchiveFile, Archive, []),
+    format(user_error, '*** ~q~n', [archive_open_named_debug_2(ArchiveFile, EntryName, Stream, Archive)]),
+    archive_next_header(Archive, EntryName),
+    format(user_error, '*** ~q~n', [archive_open_named_debug_3(ArchiveFile, EntryName, Stream, Archive)]),
+    archive_open_entry(Archive, Stream),
+    format(user_error, '*** ~q~n', [archive_open_named_debug_4(ArchiveFile, EntryName, Stream, Archive)]),
+    archive_close(Archive),
+    format(user_error, '*** ~q~n', [archive_open_named_debug_5(ArchiveFile, EntryName, Stream, Archive)]).
 
 % Code from documentation of archive_close/1.
 archive_open_named(ArchiveFile, EntryName, Stream) :-
