@@ -61,10 +61,9 @@ the archive, the current header and some state information.
 
 typedef enum ar_status
 { AR_VIRGIN = 0,
-  AR_OPENED,
+  AR_OPENED_ARCHIVE,
   AR_NEW_ENTRY,
-  AR_OPENED_ENTRY,
-  AR_CLOSED_ENTRY
+  AR_OPENED_ENTRY
 } ar_status;
 
 typedef struct archive_wrapper
@@ -94,8 +93,8 @@ static archive_wrapper init_archive_wrapper =
   AR_VIRGIN,		/* type			*/
   ARCHIVE_MAGIC,	/* magic		*/
   AR_VIRGIN,		/* status		*/
-  0,			/* close_parent		*/
-  0,			/* closed_archive	*/
+  FALSE,		/* close_parent		*/
+  FALSE,		/* closed_archive	*/
   NULL,			/* archive		*/
   NULL,			/* entry		*/
   archive_noop_free,	/* archive_free		*/
@@ -107,12 +106,11 @@ static archive_wrapper init_archive_wrapper =
 static const char*
 ar_status_str(ar_status status)
 { switch ( status )
-  { case AR_VIRGIN:       return "AR_VIRGIN";
-    case AR_OPENED:       return "AR_OPENED";
-    case AR_NEW_ENTRY:    return "AR_NEW_ENTRY";
-    case AR_OPENED_ENTRY: return "AR_OPENED_ENTRY";
-    case AR_CLOSED_ENTRY: return "AR_CLOSED_ENTRY";
-    default:              return "AR_???";
+  { case AR_VIRGIN:         return "AR_VIRGIN";
+    case AR_OPENED_ARCHIVE: return "AR_OPENED_ARCHIVE";
+    case AR_NEW_ENTRY:      return "AR_NEW_ENTRY";
+    case AR_OPENED_ENTRY:   return "AR_OPENED_ENTRY";
+    default:                return "AR_???";
   }
 }
 #endif
@@ -274,8 +272,7 @@ get_archive(term_t t, archive_wrapper **arp)
       return TRUE;
     }
 
-    PL_permission_error("access", "closed_archive", t);
-    return FALSE;
+    return PL_permission_error("access", "closed_archive", t);
   }
 
   return PL_type_error("archive", t);
@@ -513,7 +510,6 @@ archive_open_stream(term_t data, term_t mode, term_t handle, term_t options)
   term_t tail = PL_copy_term_ref(options);
   term_t head = PL_new_term_ref();
   term_t arg  = PL_new_term_ref();
-  int rc = ARCHIVE_OK;				/* silence compiler */
 
   { archive_wrapper ar_local = init_archive_wrapper;
     atom_t a;
@@ -800,17 +796,21 @@ archive_open_stream(term_t data, term_t mode, term_t handle, term_t options)
      archive_read_set_seek_callback(ar->archive, ar_seek);
      archive_read_set_close_callback(ar->archive, ar_close);
 
-     if ( (rc=archive_read_open1(ar->archive)) == ARCHIVE_OK )
-     { ar->status = AR_OPENED;
-       return TRUE;
+     { int rc = archive_read_open1(ar->archive);
+       if ( rc == ARCHIVE_OK )
+       { ar->status = AR_OPENED_ARCHIVE;
+         return TRUE;
+      } else
+      { return archive_error(ar, rc);
+      }
      }
   } else if ( ar->how == 'w' )
   { if ( !(ar->archive = archive_write_new()) )
       return PL_resource_error("memory");
-     /* Prevent libarchive from padding the last block to 10240 bytes. Some decompressors,
+    /* Prevent libarchive from padding the last block to 10240 bytes. Some decompressors,
        notably Oracle's jar decompressor, fail when presented with this */
-     archive_write_set_bytes_in_last_block(ar->archive, 1);
-     if (0) {}
+    archive_write_set_bytes_in_last_block(ar->archive, 1);
+    if (0) {}
 #ifdef FORMAT_7ZIP
      else if ( ar->type & FORMAT_7ZIP )    archive_write_set_format_7zip(ar->archive);
 #endif
@@ -866,16 +866,19 @@ archive_open_stream(term_t data, term_t mode, term_t handle, term_t options)
     { return PL_existence_error3("option", "filter", options);
     }
 #endif
-    if ( (rc=archive_write_open(ar->archive, ar,
-				ar_open, ar_write, ar_close)) == ARCHIVE_OK )
-    { ar->status = AR_OPENED;
-      return TRUE;
-    }
+     { int rc = archive_write_open(ar->archive, ar,
+				   ar_open, ar_write, ar_close);
+       if ( rc == ARCHIVE_OK )
+       { ar->status = AR_OPENED_ARCHIVE;
+         return TRUE;
+       } else
+       { return archive_error(ar, rc);
+       }
+     }
   } else {
     assert(0); /* ar->how isn't 'r' or 'w' */
+    return FALSE;
   }
-
-  return archive_error(ar, rc);
 }
 
 
@@ -925,15 +928,15 @@ archive_next_header(term_t archive, term_t name)
   if ( ar->how == 'w' )
   { char* pathname = NULL;
     if ( ar->status == AR_OPENED_ENTRY )
-       return PL_permission_error("next_header", "archive", archive);
+      return PL_permission_error("next_header", "archive", archive);
     if ( !PL_get_atom_chars(name, &pathname) )
-       return PL_type_error("atom", name);
+      return PL_type_error("atom", name);
     if ( ar->entry )
       archive_entry_clear(ar->entry);
     else
       ar->entry = archive_entry_new();
     if ( !ar->entry )
-       return PL_resource_error("memory");
+      return PL_resource_error("memory");
     archive_entry_set_pathname(ar->entry, pathname);
     /* libarchive-3.1.2 does not tolerate an empty size with zip. Later versions may though - it is fixed in git as of Dec 2013.
      *    For now, set the other entries to a sensible default
@@ -1195,7 +1198,7 @@ ar_close_entry(void *handle)
   }
   if ( ar->status == AR_OPENED_ENTRY )
   { PL_unregister_atom(ar->symbol);
-    ar->status = AR_CLOSED_ENTRY;
+    ar->status = AR_OPENED_ARCHIVE;
   }
   return 0;
 }
