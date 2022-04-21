@@ -70,7 +70,7 @@ typedef enum ar_status
 typedef struct archive_wrapper
 { atom_t		symbol;		/* Associated symbol */
   IOSTREAM *		data;		/* Underlying stream */
-  unsigned int		type;		/* Type of format supported */
+  unsigned int		type;		/* Types of formats/filters supported */
   int			magic;		/* magic code */
   ar_status		status;		/* Current status */
   int			close_parent;	/* Close the parent handle */
@@ -86,6 +86,21 @@ static int
 archive_noop_free(struct archive * _a)
 { return ARCHIVE_OK;
 }
+
+static archive_wrapper init_archive_wrapper =
+{
+  0,			/* symbol		*/
+  NULL,			/* data			*/
+  AR_VIRGIN,		/* type			*/
+  ARCHIVE_MAGIC,	/* magic		*/
+  AR_VIRGIN,		/* status		*/
+  0,			/* close_parent		*/
+  0,			/* closed_archive	*/
+  NULL,			/* archive		*/
+  NULL,			/* entry		*/
+  archive_noop_free,	/* archive_free		*/
+  ' '			/* how			*/
+};
 
 #if 0
 /* For debugging: */
@@ -181,11 +196,16 @@ int PL_existence_error3(const char* type, const char* object, term_t in)
 static void
 acquire_archive(atom_t symbol)
 { archive_wrapper *ar = PL_blob_data(symbol, NULL, NULL);
-  ar->symbol = symbol;
+
+  assert(ar->magic == ARCHIVE_MAGIC);
   assert(ar->archive_free);
+  assert(ar->data); /* Must have been set before PL_unify_blob() */
+
+  ar->symbol = symbol;
 }
 
 
+/* Callback from atom gc - see also ar_close(), ar_close_entry() */
 static int
 release_archive(atom_t symbol)
 { archive_wrapper *ar = PL_blob_data(symbol, NULL, NULL);
@@ -195,11 +215,15 @@ release_archive(atom_t symbol)
   /* TODO: The following assert isn't always true */
   /* assert(ar->status != AR_OPENED_ENTRY); */
 
+  /* TODO: the assignments of NULL in the following are for debugging only */
+
   archive_entry_free(ar->entry); /* Safe even if !ar->entry */
   ar->entry = NULL;
-  ar->archive_free(ar->archive);
+  ar->archive_free(ar->archive); /* Safe even if !ar->archive */
   ar->archive = NULL;
   ar->archive_free = archive_noop_free;
+
+  *ar = init_archive_wrapper; /* Wipe everything, to expose use-after-free bugs */
 
   return TRUE;
 }
@@ -269,6 +293,7 @@ ar_open(struct archive *a, void *cdata)
 }
 
 /* Callback from archive_XXX_close() or archive_XXX_free() */
+/* See also ar_close_entry(), release_archive */
 static int
 ar_close(struct archive *a, void *cdata)
 { archive_wrapper *ar = cdata;
@@ -490,31 +515,19 @@ archive_open_stream(term_t data, term_t mode, term_t handle, term_t options)
   term_t arg  = PL_new_term_ref();
   int rc = ARCHIVE_OK;				/* silence compiler */
 
-  { archive_wrapper ar_local;
+  { archive_wrapper ar_local = init_archive_wrapper;
     atom_t a;
-    memset(&ar_local, 0, sizeof ar_local);
-    ar_local.magic = ARCHIVE_MAGIC;
-    ar_local.archive_free = archive_noop_free;
-
-    if ( !PL_unify_blob(handle, &ar_local, sizeof ar_local, &archive_blob) ||
-         !PL_get_atom_ex(handle, &a) )
-      return FALSE;
-    ar = PL_blob_data(a, NULL, NULL);
-  }
-
-
-  { atom_t mname;
+    atom_t mname;
     int flags;
-
     if ( PL_get_atom_ex(mode, &mname) )
     { if ( mname == ATOM_write )
-      { ar->how = 'w';
+      { ar_local.how = 'w';
         flags = SIO_OUTPUT;
-        ar->archive_free = archive_write_free;
+        ar_local.archive_free = archive_write_free;
       } else if ( mname == ATOM_read )
-      { ar->how = 'r';
+      { ar_local.how = 'r';
         flags = SIO_INPUT;
-        ar->archive_free = archive_read_free;
+        ar_local.archive_free = archive_read_free;
       } else
       { return PL_domain_error("io_mode", mode);
       }
@@ -522,8 +535,13 @@ archive_open_stream(term_t data, term_t mode, term_t handle, term_t options)
     { return FALSE;
     }
 
-    if ( !PL_get_stream(data, &ar->data, flags) )
+    /* PL_get_stream() must be before PL_unify_blob so that there's
+       always a valid `data` field in the blob */
+    if ( !PL_get_stream(data, &ar_local.data, flags) ||
+         !PL_unify_blob(handle, &ar_local, sizeof ar_local, &archive_blob) ||
+         !PL_get_atom_ex(handle, &a) )
       return FALSE;
+    ar = PL_blob_data(a, NULL, NULL);
   }
 
   while( PL_get_list_ex(tail, head, tail) )
@@ -854,7 +872,7 @@ archive_open_stream(term_t data, term_t mode, term_t handle, term_t options)
       return TRUE;
     }
   } else {
-    assert(0);
+    assert(0); /* ar->how isn't 'r' or 'w' */
   }
 
   return archive_error(ar, rc);
@@ -1158,7 +1176,8 @@ ar_write_entry(void *handle, char *buf, size_t size)
   return written;
 }
 
-
+/* Callback from Prolog close/1 */
+/* See also ar_close(), release_archive */
 static int
 ar_close_entry(void *handle)
 { archive_wrapper *ar = handle;
@@ -1254,6 +1273,8 @@ archive_open_entry(term_t archive, term_t stream)
       Sclose(s);
       return FALSE;
     }
+  } else {
+    assert(0); /* ar->how isn't 'r' or 'w' */
   }
 
   return PL_resource_error("memory");
