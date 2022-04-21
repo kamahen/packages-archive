@@ -154,24 +154,40 @@ test(bad_mode,
       cleanup(delete_file(ArchivePath))]) :-
     archive_open(ArchivePath, neither_read_nor_write, _Archive, []).
 
+test(gc) :- % Run this last, to isolate PL_cleanup() problems TODO: remove this test
+    garbage_collect,
+    garbage_collect_atoms,
+    garbage_collect_atoms.
+
 :- end_tests(archive).
 
-:- begin_tests(debug). % TODO: Remove this once asan memory bugs have been fixed
-                       %       Also remove archive_open_named_debug/3.
+:- begin_tests(debug, % TODO: Remove this once asan memory bugs have
+                      %       been fixed Also remove
+                      %       archive_open_named_debug/3.
+               [setup(disable_gc)]).
 
 test(memleak) :-
-    set_prolog_flag(agc_margin,0), % turn off gc
-    set_prolog_flag(trace_gc, true),
     ArchivePath= '/tmp/ar_test.zip', % requires setting up manually
+    format(user_error, '~n', []),
     (   archive_open_named_debug(ArchivePath, 'XXX', _TestArchiveStream)
     *-> format(user_error, '*** memleak test - Should have failed!!!~n', [])
     ;   format(user_error, '*** memleak test - about to garbage collect(1)~n', []),
+        garbage_collect,
         garbage_collect_atoms,
         format(user_error, '*** memleak test - about to garbage collect(2)~n', []),
         garbage_collect_atoms
     ).
 
 :- end_tests(debug).
+
+disable_gc :-
+    set_prolog_flag(agc_margin,0), % turn off gc
+    set_prolog_flag(trace_gc, true),
+    set_prolog_flag(gc_thread, false),
+    set_prolog_gc_thread(false),
+    trim_stacks,
+    garbage_collect,
+    garbage_collect_atoms.
 
 create_tmp_file(Path) :-
     tmp_file_stream(utf8, Path, Out),
