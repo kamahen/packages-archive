@@ -74,30 +74,33 @@ test(create_and_entries,
     archive_entries(ArchivePath, Entries).
 
 test(create_and_open_named,
-     [setup(create_tmp_file(ArchivePath)),
+     [LineRead1 == Line1,
+      setup(create_tmp_file(ArchivePath)),
       cleanup(delete_file(ArchivePath))]) :-
     create_archive_file(ArchivePath, SrcDir, _, ExampleSourceFile),
     file_first_line(SrcDir, ExampleSourceFile, Line1),
     archive_open_named(ArchivePath, ExampleSourceFile, TestArchiveStream),
-    read_line_to_string(TestArchiveStream, Line1),
+    read_line_to_string(TestArchiveStream, LineRead1),
     close(TestArchiveStream).
 
 test(create_and_open_named_no_close, % same as above but without close/1
-     [setup(create_tmp_file(ArchivePath)),
+     [LineRead1 == Line1,
+      setup(create_tmp_file(ArchivePath)),
       cleanup(delete_file(ArchivePath))]) :-
     create_archive_file(ArchivePath, SrcDir, _, ExampleSourceFile),
     file_first_line(SrcDir, ExampleSourceFile, Line1),
     archive_open_named(ArchivePath, ExampleSourceFile, TestArchiveStream),
-    read_line_to_string(TestArchiveStream, Line1).
+    read_line_to_string(TestArchiveStream, LineRead1).
 
 test(create_and_open_named_twice_no_close,
-     [setup(create_tmp_file(ArchivePath)),
+     [LineRead1 == Line1,
+      setup(create_tmp_file(ArchivePath)),
       cleanup(delete_file(ArchivePath))]) :-
     create_archive_file(ArchivePath, SrcDir, _, ExampleSourceFile),
     file_first_line(SrcDir, ExampleSourceFile, Line1),
     archive_open_named(ArchivePath, 'swipl.rc', _Stream0),
     archive_open_named(ArchivePath, ExampleSourceFile, TestArchiveStream),
-    read_line_to_string(TestArchiveStream, Line1).
+    read_line_to_string(TestArchiveStream, LineRead1).
 
 % TODO: following test causes memory leak:
 test(create_and_open_named_fail, % Same as above but with bad EntryName
@@ -109,22 +112,24 @@ test(create_and_open_named_fail, % Same as above but with bad EntryName
 
 % TODO: following test causes memory leak:
 test(create_and_open_archive_entry,
-     [setup(create_tmp_file(ArchivePath)),
+     [LineRead1 == Line1,
+      setup(create_tmp_file(ArchivePath)),
       cleanup(delete_file(ArchivePath))]) :-
     create_archive_file(ArchivePath, SrcDir, _, ExampleSourceFile),
     file_first_line(SrcDir, ExampleSourceFile, Line1),
     open_archive_entry(ArchivePath, ExampleSourceFile, TestArchiveStream),
-    read_line_to_string(TestArchiveStream, Line1),
+    read_line_to_string(TestArchiveStream, LineRead1),
     close(TestArchiveStream).
 
 % TODO: following test causes memory leak:
 test(create_and_open_archive_entry_no_close, % same as above but without close/1
-     [setup(create_tmp_file(ArchivePath)),
+     [LineRead1 == Line1,
+      setup(create_tmp_file(ArchivePath)),
       cleanup(delete_file(ArchivePath))]) :-
     create_archive_file(ArchivePath, SrcDir, _, ExampleSourceFile),
     file_first_line(SrcDir, ExampleSourceFile, Line1),
     open_archive_entry(ArchivePath, ExampleSourceFile, TestArchiveStream),
-    read_line_to_string(TestArchiveStream, Line1).
+    read_line_to_string(TestArchiveStream, LineRead1).
 
 % TODO: following test causes memory leak:
 test(create_and_open_archive_entry_no_close, % same as above but bad EntryName
@@ -153,6 +158,210 @@ test(bad_mode,
       setup(create_tmp_file(ArchivePath)),
       cleanup(delete_file(ArchivePath))]) :-
     archive_open(ArchivePath, neither_read_nor_write, _Archive, []).
+
+test(double_open_write,
+     [fail,
+      setup(create_tmp_file(ArchivePath)),
+      cleanup(delete_file(ArchivePath))]) :-
+    % This should fail because blob doesn't have PL_BLOB_UNIQUE
+    archive_open(ArchivePath, write, Archive, [format(zip)]),
+    archive_open(ArchivePath, write, Archive, [format(zip)]).
+
+test(double_open_entry_write,
+     [error(permission_error(access,archive_entry,Archive)),
+      setup(create_tmp_file(ArchivePath)),
+      cleanup(delete_file(ArchivePath))]) :-
+    archive_open(ArchivePath, write, Archive, [format(zip)]),
+    archive_next_header(Archive, item1),
+    archive_open_entry(Archive, _Stream1),
+    archive_open_entry(Archive, _Stream2).
+
+test(double_next_header_write,
+     [error(permission_error(next_header,archive,Archive)),
+      setup(create_tmp_file(ArchivePath)),
+      cleanup(delete_file(ArchivePath))]) :-
+    archive_open(ArchivePath, write, Archive, [format(zip)]),
+    archive_next_header(Archive, item1),
+    archive_open_entry(Archive, _Stream1),
+    archive_next_header(Archive, item2),
+    archive_open_entry(Archive, _Stream2).
+
+test(double_open_read,
+     [fail,
+      setup(create_tmp_file(ArchivePath)),
+      cleanup(delete_file(ArchivePath))]) :-
+    % This should fail because blob doesn't have PL_BLOB_UNIQUE
+    create_archive_file(ArchivePath, _, _, _),
+    archive_open(ArchivePath, read, Archive, []),
+    archive_open(ArchivePath, read, Archive, []).
+
+test(double_open_read2,
+     [setup(create_tmp_file(ArchivePath)),
+      cleanup(delete_file(ArchivePath))]) :-
+    create_archive_file(ArchivePath, _, _, _),
+    % It's OK to open an archive twice for input with 2 different streams
+    archive_open(ArchivePath, read, Archive1, []),
+    archive_open(ArchivePath, read, Archive2, []),
+    archive_close(Archive1),
+    archive_close(Archive2).
+
+test(double_open_entry_read,
+     [error(permission_error(access,archive_entry,Archive)),
+      setup(create_tmp_file(ArchivePath)),
+      cleanup(delete_file(ArchivePath))]) :-
+    create_archive_file(ArchivePath, _, _, ExampleSourceFile),
+    archive_open(ArchivePath, read, Archive, []),
+    archive_next_header(Archive, ExampleSourceFile),
+    archive_open_entry(Archive, _Stream1),
+    archive_open_entry(Archive, _Stream2).
+
+test(double_next_header_read,
+     [error(permission_error(next_header,archive,Archive)),
+      setup(create_tmp_file(ArchivePath)),
+      cleanup(delete_file(ArchivePath))]) :-
+    create_archive_file(ArchivePath, _, FilesOut, _),
+    archive_open(ArchivePath, read, Archive, []),
+    FilesOut = [Item1, Item2 | _],
+    archive_next_header(Archive, Item1),
+    archive_open_entry(Archive, _Stream1),
+    archive_next_header(Archive, Item2),
+    archive_open_entry(Archive, _Stream2).
+
+test(next_header_order1,
+     [setup(create_tmp_file(ArchivePath)),
+      cleanup(delete_file(ArchivePath))]) :-
+    create_archive_file(ArchivePath, _, FilesOut, _),
+    archive_open(ArchivePath, read, Archive, []),
+    archive_next_header(Archive, Item1),
+    archive_next_header(Archive, Item2),
+    assertion(ground(FilesOut)), % Ensure it's safe to use =/2 for next assertion
+    assertion(FilesOut = [Item1, Item2|_]),
+    archive_close(Archive).
+
+test(next_header_order2,
+     [fail,
+      setup(create_tmp_file(ArchivePath)),
+      cleanup(delete_file(ArchivePath))]) :-
+    create_archive_file(ArchivePath, _, FilesOut, _),
+    FilesOut = [Item1, Item2|_],
+    archive_open(ArchivePath, read, Archive, []),
+    archive_next_header(Archive, Item2),
+    archive_next_header(Archive, Item1). % Can only go forward
+
+test(next_header_order3,
+     [setup(create_tmp_file(ArchivePath)), 
+      cleanup(delete_file(ArchivePath))]) :-
+    create_archive_file(ArchivePath, _, FilesOut, _),
+    FilesOut = [Item1, _Item2, Item3|_],
+    archive_open(ArchivePath, read, Archive, []),
+    archive_next_header(Archive, Item1),
+    archive_next_header(Archive, Item3), % Can skip forward
+    archive_close(Archive).
+
+test(next_header_order4,
+     [setup(create_tmp_file(ArchivePath)),
+      cleanup(delete_file(ArchivePath))]) :-
+    create_archive_file(ArchivePath, _, FilesOut, _),
+    FilesOut = [_Item1, Item2, Item3|_],
+    archive_open(ArchivePath, read, Archive, []),
+    archive_next_header(Archive, Item2),
+    archive_next_header(Archive, NextItem3),
+    assertion(NextItem3 == Item3),
+    archive_close(Archive).
+
+test(close_parent1,
+     [setup(create_tmp_file(ArchivePath)),
+      cleanup(delete_file(ArchivePath))]) :-
+    create_archive_file(ArchivePath, _, _FilesOut, Example),
+    open(ArchivePath, read, Stream, [type(binary)]),
+    assertion(is_stream(Stream)),
+    archive_open(Stream, read, Archive, [close_parent(false)]),
+    archive_next_header(Archive, Example),
+    archive_close(Archive),
+    assertion(is_stream(Stream)),
+    close(Stream),
+    assertion(\+ is_stream(Stream)).
+
+test(close_parent2,
+     [setup(create_tmp_file(ArchivePath)),
+      cleanup(delete_file(ArchivePath))]) :-
+    create_archive_file(ArchivePath, _, _FilesOut, Example),
+    open(ArchivePath, read, Stream, [type(binary)]),
+    assertion(is_stream(Stream)),
+    archive_open(Stream, read, Archive, [close_parent(true)]),
+    archive_next_header(Archive, Example),
+    archive_close(Archive),
+    assertion(\+ is_stream(Stream)).
+
+test(close_parent3,
+     [error(archive_error(_,fatal,Archive,archive_free)),
+      setup(create_tmp_file(ArchivePath)),
+      cleanup(delete_file(ArchivePath))]) :-
+    create_archive_file(ArchivePath, _, _FilesOut, Example),
+    % Same as close_parent3, but has close(Stream) before archive_close(Archive).
+    open(ArchivePath, read, Stream, [type(binary)]),
+    assertion(is_stream(Stream)),
+    archive_open(Stream, read, Archive, [close_parent(true)]),
+    archive_next_header(Archive, Example),
+    close(Stream),
+    assertion(\+ is_stream(Stream)),
+    archive_close(Archive).
+
+test(close_entry1,
+     [setup(create_tmp_file(ArchivePath)),
+      cleanup(delete_file(ArchivePath))]) :-
+    create_archive_file(ArchivePath, _, _FilesOut, Example),
+    open(ArchivePath, read, Stream, [type(binary)]),
+    archive_open(Stream, read, Archive, [close_parent(false)]),
+    archive_next_header(Archive, Example),
+    archive_open_entry(Archive, ExampleStream),
+    read_line_to_string(ExampleStream, _LineRead1),
+    close(ExampleStream),
+    archive_close(Archive),
+    close(Stream).
+
+test(close_entry2,
+     [setup(create_tmp_file(ArchivePath)),
+      cleanup(delete_file(ArchivePath))]) :-
+    create_archive_file(ArchivePath, _, _FilesOut, Example),
+    % Like close_entry1, but ExampleStream is closed after archive_close/2
+    open(ArchivePath, read, Stream, [type(binary)]),
+    archive_open(Stream, read, Archive, [close_parent(false)]),
+    archive_next_header(Archive, Example),
+    archive_open_entry(Archive, ExampleStream),
+    read_line_to_string(ExampleStream, _LineRead1),
+    archive_close(Archive),
+    close(ExampleStream),
+    close(Stream).
+
+test(close_entry3,
+     [LineRead1 == Line1,
+      setup(create_tmp_file(ArchivePath)),
+      cleanup(delete_file(ArchivePath))]) :-
+    create_archive_file(ArchivePath, SrcDir, _FilesOut, ExampleSourceFile),
+    file_first_line(SrcDir, ExampleSourceFile, Line1),
+    % Like close_entry1, but archive_close/2 is called while entry stream still open
+    open(ArchivePath, read, Stream, [type(binary)]),
+    archive_open(Stream, read, Archive, [close_parent(false)]),
+    archive_next_header(Archive, ExampleSourceFile),
+    archive_open_entry(Archive, ExampleStream),
+    archive_close(Archive),
+    read_line_to_string(ExampleStream, LineRead1).
+
+test(close_entry4,
+     [error(archive_error(_,fatal,Archive,archive_read_next_header)),
+      setup(create_tmp_file(ArchivePath)),
+      cleanup(delete_file(ArchivePath))]) :-
+    create_archive_file(ArchivePath, _, _FilesOut, Example),
+    % Like close_entry1, but Stream is closed before any archive actions
+    open(ArchivePath, read, Stream, [type(binary)]),
+    archive_open(Stream, read, Archive, [close_parent(false)]),
+    close(Stream),
+    archive_next_header(Archive, Example),
+    archive_open_entry(Archive, ExampleStream),
+    read_line_to_string(ExampleStream, _LineRead1),
+    close(ExampleStream),
+    archive_close(Archive).
 
 test(gc) :- % Run this last, to isolate PL_cleanup() problems TODO: remove this test
     garbage_collect,

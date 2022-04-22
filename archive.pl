@@ -133,15 +133,16 @@ archive_open(Stream, Archive, Options) :-
 %
 %   Open the  archive in  Data and  unify Archive with  a handle  to the
 %   opened archive.  Data is either a  file name (as accepted by open/4)
-%   or a stream that contains a valid archive.  Mode is either `read` or
-%   `write`.  Details  are controlled by Options.  Typically, the option
-%   close_parent(true) is used  to close an entry stream  if the archive
-%   is closed  using archive_close/1.   For other options  when reading,
-%   the defaults  are typically fine -  for writing, a valid  format and
-%   optional filters must be specified.   The option format(raw) must be
-%   used  to process  compressed streams  that do  not contain  explicit
-%   entries  (e.g.,  gzip'ed  data)  unambibuously.   The  =raw=  format
-%   creates a _pseudo archive_ holding a single member named =data=.
+%   or a stream that has been  opened with the option type(binary). Mode
+%   is either  `read` or  `write`.  Details  are controlled  by Options.
+%   Typically, the option  close_parent(true) is used to  close the Data
+%   stream if  the archive is  closed using archive_close/1.   For other
+%   options when reading, the defaults are typically fine - for writing,
+%   a valid format  and optional filters must be  specified.  The option
+%   format(raw) must be  used to process compressed streams  that do not
+%   contain explicit  entries (e.g.,  gzip'ed data)  unambibuously.  The
+%   =raw=  format creates  a _pseudo  archive_ holding  a single  member
+%   named =data=.
 %
 %     * close_parent(+Boolean)
 %     If this option is =true=  (default =false=), Data stream is closed

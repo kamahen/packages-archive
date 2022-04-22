@@ -66,6 +66,7 @@ typedef enum ar_status
   AR_OPENED_ARCHIVE,
   AR_NEW_ENTRY,
   AR_OPENED_ENTRY,
+  AR_CLOSED,
   AR_ERROR
 } ar_status;
 
@@ -91,7 +92,8 @@ archive_noop_free(struct archive * _a)
 
 static int
 set_error_status(archive_wrapper *ar, int rc)
-{ ar->status = AR_ERROR;
+{ if ( ar )
+    ar->status = AR_ERROR;
   return rc;
 }
 
@@ -119,6 +121,7 @@ ar_status_str(ar_status status)
     case AR_OPENED_ARCHIVE: return "AR_OPENED_ARCHIVE";
     case AR_NEW_ENTRY:      return "AR_NEW_ENTRY";
     case AR_OPENED_ENTRY:   return "AR_OPENED_ENTRY";
+    case AR_CLOSED:         return "AR_CLOSED";
     case AR_ERROR:          return "AR_ERROR";
     default:                return "AR_???";
   }
@@ -130,8 +133,8 @@ ar_status_str(ar_status status)
 static void
 dbg_ar(const char *msg, const archive_wrapper *ar)
 {
-  Sdprintf("%-25s %p (%c) %-18s close_parent=%d closed_archive=%d symbol=%lu\n",
-           msg, ar, ar->how, ar_status_str(ar->status),
+  Sdprintf("%-25s %p %p (%c) %-18s close_parent=%d closed_archive=%d symbol=%lu\n",
+           msg, ar, ar->data, ar->how, ar_status_str(ar->status),
            ar->close_parent, ar->closed_archive,
            (long unsigned)ar->symbol);
   assert(ar->magic == ARCHIVE_MAGIC);
@@ -191,7 +194,7 @@ static atom_t ATOM_read;
 static atom_t ATOM_write;
 
 static functor_t FUNCTOR_error2;
-static functor_t FUNCTOR_archive_error2;
+static functor_t FUNCTOR_archive_error4;
 static functor_t FUNCTOR_existence_error3;
 static functor_t FUNCTOR_filetype1;
 static functor_t FUNCTOR_format1;
@@ -252,6 +255,7 @@ release_archive(atom_t symbol)
   ar->archive_free = archive_noop_free;
 
   *ar = init_archive_wrapper; /* Wipe everything, to expose use-after-free bugs */
+  ar->status = AR_CLOSED;
 
   return TRUE;
 }
@@ -400,10 +404,11 @@ ar_seek(struct archive *a, void *cdata, la_int64_t request, int whence)
 		 *******************************/
 
 static int
-archive_error(const archive_wrapper *ar, int rc)
-{ int eno = archive_errno(ar->archive);
-  const char *s = archive_error_string(ar->archive);
+archive_error(const archive_wrapper *ar, int rc, term_t t, const char *msg)
+{ int eno = ar->archive ? archive_errno(ar->archive) : 0;
+  const char *s = ar->archive ? archive_error_string(ar->archive) : NULL;
   term_t ex;
+  dbg_ar("ARCHIVE_ERROR", ar);
 
   if ( eno == 0 )
     eno = rc;
@@ -422,9 +427,11 @@ archive_error(const archive_wrapper *ar, int rc)
   if ( ( (ex = PL_new_term_ref()) &&
 	 PL_unify_term(ex,
 		       PL_FUNCTOR, FUNCTOR_error2,
-			 PL_FUNCTOR, FUNCTOR_archive_error2,
+			 PL_FUNCTOR, FUNCTOR_archive_error4,
 			   PL_INT, eno,
 			   PL_CHARS, s,
+			   PL_TERM, t,
+			   PL_CHARS, msg,
 			 PL_VARIABLE) ) )
     return PL_raise_exception(ex);
 
@@ -834,7 +841,7 @@ archive_open_stream(term_t data, term_t mode, term_t handle, term_t options)
          dbg_ar("ARCHIVE_OPEN_STREAM/2", ar);
          return TRUE;
       } else
-      { return set_error_status(ar, archive_error(ar, rc));
+       { return set_error_status(ar, archive_error(ar, rc, data, "archive_read_open1"));
       }
      }
   } else if ( ar->how == 'w' )
@@ -906,7 +913,7 @@ archive_open_stream(term_t data, term_t mode, term_t handle, term_t options)
          dbg_ar("ARCHIVE_OPEN_STREAM/3", ar);
          return TRUE;
        } else
-       { return set_error_status(ar, archive_error(ar, rc));
+       { return set_error_status(ar, archive_error(ar, rc, data, "archive_write_open"));
        }
      }
   } else {
@@ -987,7 +994,7 @@ archive_next_header(term_t archive, term_t name)
   assert(ar->how == 'r');
   if ( ar->status == AR_NEW_ENTRY )
   { if ( (rc=archive_read_data_skip(ar->archive)) != ARCHIVE_OK )
-      return set_error_status(ar, archive_error(ar, rc));
+      return set_error_status(ar, archive_error(ar, rc, archive, "archive_read_data_skip"));
   } else if ( ar->status == AR_OPENED_ENTRY )
   { return set_error_status(ar, PL_permission_error("next_header", "archive", archive));
   }
@@ -1006,7 +1013,7 @@ archive_next_header(term_t archive, term_t name)
   if ( rc == ARCHIVE_EOF )
     return FALSE;			/* simply at the end */
 
-  return set_error_status(ar, archive_error(ar, rc));
+  return set_error_status(ar, archive_error(ar, rc, archive, "archive_read_next_header"));
 }
 
 
@@ -1027,11 +1034,16 @@ archive_close(term_t archive)
   { ar->entry = NULL;
     ar->archive = NULL;
     ar->symbol = 0;
+    ar->status = AR_CLOSED;
 
     return TRUE;
   }
 
-  return set_error_status(ar, archive_error(ar, rc));
+  ar->archive = NULL; /* archive_error() can't use ar->archive */
+  ar->entry = NULL;
+  ar->symbol = 0;
+  ar->status = AR_ERROR;
+  return set_error_status(ar, archive_error(ar, rc, archive, "archive_free"));
 }
 
 		 /*******************************
@@ -1233,6 +1245,7 @@ ar_close_entry(void *handle)
       { ar->entry = NULL;
 	ar->archive = NULL;
 	ar->symbol = 0;
+        ar->status = AR_CLOSED;
       } else
       { ar->status = AR_ERROR;
         dbg_ar("AR_CLOSE_ENTRY/2", ar);
@@ -1294,6 +1307,8 @@ archive_open_entry(term_t archive, term_t stream)
   if ( !get_archive(archive, &ar) )
     return FALSE;
   dbg_ar("ARCHIVE_OPEN_ENTRY", ar);
+  if ( !(ar->status == AR_NEW_ENTRY) )
+    return set_error_status(ar, PL_permission_error("access", "archive_entry", archive));
   if ( ar->how == 'r' )
   { if ( (s=Snew(ar, SIO_INPUT|SIO_RECORDPOS, &ar_entry_read_functions)) )
     { ar->status = AR_OPENED_ENTRY;
@@ -1306,13 +1321,9 @@ archive_open_entry(term_t archive, term_t stream)
     }
   } else if ( ar->how == 'w' )
   { /* First we must finalize the header before trying to write the data */
-    if ( ar->status == AR_NEW_ENTRY )
-    { archive_write_header(ar->archive, ar->entry);
-      archive_entry_free(ar->entry);
-      ar->entry = NULL;
-    } else
-    { return set_error_status(ar, PL_permission_error("access", "archive_entry", archive));
-    }
+    archive_write_header(ar->archive, ar->entry);
+    archive_entry_free(ar->entry);
+    ar->entry = NULL;
     /* Then we can make a handle for the data */
     if ( (s=Snew(ar, SIO_OUTPUT|SIO_RECORDPOS, &ar_entry_write_functions)) )
     { ar->status = AR_OPENED_ENTRY;
@@ -1384,7 +1395,7 @@ install_archive4pl(void)
   MKATOM(read);
 
   MKFUNCTOR(error,           2);
-  MKFUNCTOR(archive_error,   2);
+  MKFUNCTOR(archive_error,   4);
   MKFUNCTOR(existence_error, 3);
   MKFUNCTOR(filetype,        1);
   MKFUNCTOR(mtime,           1);
