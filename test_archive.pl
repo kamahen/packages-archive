@@ -51,7 +51,9 @@ test_archive :-
               ]).
 
 :- begin_tests(archive,
-               [ condition(archive_has_format(zip))
+               [ condition(archive_has_format(zip)),
+                 % setup(disable_gc), % DO NOT SUBMIT
+                 cleanup(( format(user_error, '***disable_gc~n', []), disable_gc ))
                ]).
 
 % The following is derived from check_installation/0 for archive:
@@ -168,23 +170,24 @@ test(double_open_write,
     archive_open(ArchivePath, write, Archive, [format(zip)]).
 
 test(double_open_entry_write,
-     [error(permission_error(access,archive_entry,Archive)),
+     [error(permission_error('access(w)-AR_OPENED_ENTRY',archive_entry,Archive)),
       setup(create_tmp_file(ArchivePath)),
       cleanup(delete_file(ArchivePath))]) :-
     archive_open(ArchivePath, write, Archive, [format(zip)]),
     archive_next_header(Archive, item1),
-    archive_open_entry(Archive, _Stream1),
+    archive_open_entry(Archive, Stream1),
+    assertion(stream_property(Stream1, output)),
+    assertion(\+ stream_property(Stream1, input)),
     archive_open_entry(Archive, _Stream2).
 
 test(double_next_header_write,
-     [error(permission_error(next_header,archive,Archive)),
+     [error(permission_error('next_header(w)-AR_OPENED_ENTRY',archive,Archive)),
       setup(create_tmp_file(ArchivePath)),
       cleanup(delete_file(ArchivePath))]) :-
     archive_open(ArchivePath, write, Archive, [format(zip)]),
     archive_next_header(Archive, item1),
     archive_open_entry(Archive, _Stream1),
-    archive_next_header(Archive, item2),
-    archive_open_entry(Archive, _Stream2).
+    archive_next_header(Archive, item2).
 
 test(double_open_read,
      [fail,
@@ -206,17 +209,19 @@ test(double_open_read2,
     archive_close(Archive2).
 
 test(double_open_entry_read,
-     [error(permission_error(access,archive_entry,Archive)),
+     [error(permission_error('access(r)-AR_OPENED_ENTRY',archive_entry,Archive)),
       setup(create_tmp_file(ArchivePath)),
       cleanup(delete_file(ArchivePath))]) :-
     create_archive_file(ArchivePath, _, _, ExampleSourceFile),
     archive_open(ArchivePath, read, Archive, []),
     archive_next_header(Archive, ExampleSourceFile),
-    archive_open_entry(Archive, _Stream1),
+    archive_open_entry(Archive, Stream1),
+    assertion(stream_property(Stream1, input)),
+    assertion(\+ stream_property(Stream1, output)),
     archive_open_entry(Archive, _Stream2).
 
 test(double_next_header_read,
-     [error(permission_error(next_header,archive,Archive)),
+     [error(permission_error('next_header(r)-AR_OPENED_ENTRY',archive,Archive)),
       setup(create_tmp_file(ArchivePath)),
       cleanup(delete_file(ArchivePath))]) :-
     create_archive_file(ArchivePath, _, FilesOut, _),
@@ -224,8 +229,7 @@ test(double_next_header_read,
     FilesOut = [Item1, Item2 | _],
     archive_next_header(Archive, Item1),
     archive_open_entry(Archive, _Stream1),
-    archive_next_header(Archive, Item2),
-    archive_open_entry(Archive, _Stream2).
+    archive_next_header(Archive, Item2).
 
 test(next_header_order1,
      [setup(create_tmp_file(ArchivePath)),
@@ -363,6 +367,15 @@ test(close_entry4,
     close(ExampleStream),
     archive_close(Archive).
 
+test(no_next_header,
+     [error(permission_error('access(r)-AR_OPENED_ARCHIVE',archive_entry,Archive)),
+      setup(create_tmp_file(ArchivePath)),
+      cleanup(delete_file(ArchivePath))]) :-
+    create_archive_file(ArchivePath, _, _FilesOut, Example),
+    open(ArchivePath, read, Stream, [type(binary)]),
+    archive_open(Stream, read, Archive, [close_parent(false)]),
+    archive_open_entry(Archive, Example).
+
 test(gc) :- % Run this last, to isolate PL_cleanup() problems TODO: remove this test
     garbage_collect,
     garbage_collect_atoms,
@@ -373,7 +386,8 @@ test(gc) :- % Run this last, to isolate PL_cleanup() problems TODO: remove this 
 :- begin_tests(debug, % TODO: Remove this once asan memory bugs have
                       %       been fixed Also remove
                       %       archive_open_named_debug/3.
-               [setup(disable_gc)]).
+               [setup(disable_gc),
+                cleanup(disable_gc)]).
 
 test(memleak) :-
     ArchivePath= '/tmp/ar_test.zip', % requires setting up manually
@@ -392,8 +406,8 @@ test(memleak) :-
 disable_gc :-
     set_prolog_flag(agc_margin,0), % turn off gc
     set_prolog_flag(trace_gc, true),
-    set_prolog_flag(gc_thread, false),
-    set_prolog_gc_thread(false),
+    % set_prolog_flag(gc_thread, false),
+    % set_prolog_gc_thread(false),
     trim_stacks,
     garbage_collect,
     garbage_collect_atoms.
