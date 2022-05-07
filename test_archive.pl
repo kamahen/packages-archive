@@ -38,7 +38,6 @@
 	  ]).
 :- use_module(library(plunit)).
 :- use_module(library(archive)).
-:- use_module(library(readutil), [read_line_to_string/2]).
 :- use_module(library(apply), [maplist/3, maplist/2]).
 :- use_module(library(filesex), [directory_file_path/3, relative_file_name/3]).
 :- use_module(library(lists), [nth1/3]).
@@ -76,33 +75,33 @@ test(create_and_entries,
     archive_entries(ArchivePath, Entries).
 
 test(create_and_open_named,
-     [LineRead1 == Line1,
+     [ContentsRead1 == Contents1,
       setup(create_tmp_file(ArchivePath)),
       cleanup(delete_file(ArchivePath))]) :-
     create_archive_file(ArchivePath, SrcDir, _, ExampleSourceFile),
-    file_first_line(SrcDir, ExampleSourceFile, Line1),
+    file_contents(SrcDir, ExampleSourceFile, Contents1),
     archive_open_named(ArchivePath, ExampleSourceFile, TestArchiveStream),
-    read_line_to_string(TestArchiveStream, LineRead1),
+    read_string(TestArchiveStream, _Len, ContentsRead1),
     close(TestArchiveStream).
 
 test(create_and_open_named_no_close, % same as above but without close/1
-     [LineRead1 == Line1,
+     [ContentsRead1 == Contents1,
       setup(create_tmp_file(ArchivePath)),
       cleanup(delete_file(ArchivePath))]) :-
     create_archive_file(ArchivePath, SrcDir, _, ExampleSourceFile),
-    file_first_line(SrcDir, ExampleSourceFile, Line1),
+    file_contents(SrcDir, ExampleSourceFile, Contents1),
     archive_open_named(ArchivePath, ExampleSourceFile, TestArchiveStream),
-    read_line_to_string(TestArchiveStream, LineRead1).
+    read_string(TestArchiveStream, _Len, ContentsRead1).
 
 test(create_and_open_named_twice_no_close,
-     [LineRead1 == Line1,
+     [ContentsRead1 == Contents1,
       setup(create_tmp_file(ArchivePath)),
       cleanup(delete_file(ArchivePath))]) :-
     create_archive_file(ArchivePath, SrcDir, _, ExampleSourceFile),
-    file_first_line(SrcDir, ExampleSourceFile, Line1),
+    file_contents(SrcDir, ExampleSourceFile, Contents1),
     archive_open_named(ArchivePath, 'swipl.rc', _Stream0),
     archive_open_named(ArchivePath, ExampleSourceFile, TestArchiveStream),
-    read_line_to_string(TestArchiveStream, LineRead1).
+    read_string(TestArchiveStream, _Len, ContentsRead1).
 
 % TODO: following test causes memory leak:
 test(create_and_open_named_fail, % Same as above but with bad EntryName
@@ -114,24 +113,24 @@ test(create_and_open_named_fail, % Same as above but with bad EntryName
 
 % TODO: following test causes memory leak:
 test(create_and_open_archive_entry,
-     [LineRead1 == Line1,
+     [ContentsRead1 == Contents1,
       setup(create_tmp_file(ArchivePath)),
       cleanup(delete_file(ArchivePath))]) :-
     create_archive_file(ArchivePath, SrcDir, _, ExampleSourceFile),
-    file_first_line(SrcDir, ExampleSourceFile, Line1),
+    file_contents(SrcDir, ExampleSourceFile, Contents1),
     open_archive_entry(ArchivePath, ExampleSourceFile, TestArchiveStream),
-    read_line_to_string(TestArchiveStream, LineRead1),
+    read_string(TestArchiveStream, _Len, ContentsRead1),
     close(TestArchiveStream).
 
 % TODO: following test causes memory leak:
 test(create_and_open_archive_entry_no_close, % same as above but without close/1
-     [LineRead1 == Line1,
+     [ContentsRead1 == Contents1,
       setup(create_tmp_file(ArchivePath)),
       cleanup(delete_file(ArchivePath))]) :-
     create_archive_file(ArchivePath, SrcDir, _, ExampleSourceFile),
-    file_first_line(SrcDir, ExampleSourceFile, Line1),
+    file_contents(SrcDir, ExampleSourceFile, Contents1),
     open_archive_entry(ArchivePath, ExampleSourceFile, TestArchiveStream),
-    read_line_to_string(TestArchiveStream, LineRead1).
+    read_string(TestArchiveStream, _Len, ContentsRead1).
 
 % TODO: following test causes memory leak:
 test(create_and_open_archive_entry_no_close, % same as above but bad EntryName
@@ -319,7 +318,7 @@ test(close_entry1,
     archive_open(Stream, read, Archive, [close_parent(false)]),
     archive_next_header(Archive, Example),
     archive_open_entry(Archive, ExampleStream),
-    read_line_to_string(ExampleStream, _LineRead1),
+    read_line_to_string(ExampleStream, _ContentsRead1),
     close(ExampleStream),
     archive_close(Archive),
     close(Stream).
@@ -333,24 +332,24 @@ test(close_entry2,
     archive_open(Stream, read, Archive, [close_parent(false)]),
     archive_next_header(Archive, Example),
     archive_open_entry(Archive, ExampleStream),
-    read_line_to_string(ExampleStream, _LineRead1),
+    read_line_to_string(ExampleStream, _ContentsRead1),
     archive_close(Archive),
     close(ExampleStream),
     close(Stream).
 
 test(close_entry3,
-     [LineRead1 == Line1,
+     [ContentsRead1 == Contents1,
       setup(create_tmp_file(ArchivePath)),
       cleanup(delete_file(ArchivePath))]) :-
     create_archive_file(ArchivePath, SrcDir, _FilesOut, ExampleSourceFile),
-    file_first_line(SrcDir, ExampleSourceFile, Line1),
+    file_first_line(SrcDir, ExampleSourceFile, Contents1),
     % Like close_entry1, but archive_close/2 is called while entry stream still open
     open(ArchivePath, read, Stream, [type(binary)]),
     archive_open(Stream, read, Archive, [close_parent(false)]),
     archive_next_header(Archive, ExampleSourceFile),
     archive_open_entry(Archive, ExampleStream),
     archive_close(Archive),
-    read_line_to_string(ExampleStream, LineRead1).
+    read_line_to_string(ExampleStream, ContentsRead1).
 
 test(close_entry4,
      [error(archive_error(_,fatal,Archive,archive_read_next_header)),
@@ -363,7 +362,7 @@ test(close_entry4,
     close(Stream),
     archive_next_header(Archive, Example),
     archive_open_entry(Archive, ExampleStream),
-    read_line_to_string(ExampleStream, _LineRead1),
+    read_line_to_string(ExampleStream, _ContentsRead1),
     close(ExampleStream),
     archive_close(Archive).
 
@@ -446,11 +445,11 @@ archive_has_format(Format) :-
     ),
     \+ subsumes_term(error(domain_error(format, _),_), E).
 
-file_first_line(SrcDir, File, Line) :-
+file_contents(SrcDir, File, Contents) :-
     directory_file_path(SrcDir, File, Path),
     setup_call_cleanup(
-        open(Path, read, In),
-        read_line_to_string(In, Line),
+        open(Path, read, In, [type(binary)]),
+        read_string(In, _Len, Contents),
         close(In)).
 
 % TODO: delete this when debug test casesa are removed
