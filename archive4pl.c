@@ -44,11 +44,12 @@
 #include <string.h>
 #include <errno.h>
 #include <ctype.h>
-#include <stdio.h>
+#include <errno.h>
 
-#define DBG
+// #define DBG // DO NOT SUBMIT
 
 #if ARCHIVE_VERSION_NUMBER < 3000000
+/* This should never happen if cmake is set up properly */
 #error "Requires libarchive 3.0.0 or later"
 #endif
 
@@ -62,32 +63,36 @@ the archive, the current header and some state information.
 
 #define ARCHIVE_MAGIC 348184378
 
-/* The normal way of calling the predicates (similar for both read and
-   write).  [`ar` is the archive_wrapper blob]
+/* The normal way of calling the predicates.  [`ar` is the archive_wrapper blob]
 
    For reading (ar->entry is allocated by archive_read_next_header):
-     archive_open_stream(Stream, read, Archive, Options),  % AR_VIRGIN -> AR_OPENED_ARCHIVE
+     archive_open_stream(ParentStream, read,
+                         Archive, Options),      % AR_VIRGIN -> AR_OPENED_ARCHIVE
      repeat:
-       archive_next_header(Stream, Name),                  % AR_OPENED_ARCHIVE -> AR_NEW_ENTRY
-       archive_header_prop_(Archive, Property),
-       archive_open_entry(Archive, EntryStream),           % AR_NEW_ENTRY -> AR_OPENED_ENTRY
-       read(EntryStream, ...), get_code(EntryStream,Code), etc.
-       close(EntryStream),           % ar_entry_close_cb() % AR_OPENED_ENTRY _> AR_OPENED_ARCHIVE
-     archive_close(Archive),                               % ... -> AR_VIRGIN
-     close(Stream)
+       archive_next_header(Archive, Name),       % AR_OPENED_ARCHIVE -> AR_NEW_ENTRY
+       archive_header_property(Archive, Property),
+       archive_open_entry(Archive, EntryStream), % AR_NEW_ENTRY -> AR_OPENED_ENTRY
+       <read from EntryStream>
+       close(EntryStream), % ar_entry_close_cb() % AR_OPENED_ENTRY _> AR_OPENED_ARCHIVE
+     archive_close(Archive),                     % ... -> AR_VIRGIN or AR_OPENED_ENTRY_PENDING_CLOSE
+     close(ParentStream)                         % done implicitly by archive_close(Archive) if close_parent(true)
 
-   For writing (ar->entry is allocated by archive_entry_new()):
-     archive_open_stream(Stream, write, Archive, Options), % AR_VIRGIN -> AR_OPENED_ARCHIVE
-     repeat:
-       archive_next_header(Stream, Name),                  % AR_OPENED_ARCHIVE -> AR_NEW_ENTRY
-       archive_set_header_property(Archive, Property),
-       archive_open_entry(Archive, EntryStream),           % AR_NEW_ENTRY -> AR_OPENED_ENTRY
-       write(EntryStream, ...), format(EntryStream, ...), etc.
-       close(EntryStream),           % ar_entry_close_cb() % AR_OPENED_ENTRY _> AR_OPENED_ARCHIVE
-     archive_close(Archive),                               % ... -> AR_VIRGIN
-     close(Stream)
+   It's similar for writing (ar->entry is allocated by
+   archive_entry_new()), except for `write` mode instead of `read`,
+   archive_set_header_property/2 instead of archive_header_property/2,
+   and writing to EntryStream.
 
-   When the `ar` blob is created, it stores the Stream in ar->data by
+   If close_parent(bool) is specified in archive_open_stream/4, the
+   close(EntryStrea
+
+   For both reading and writing an archive, if archive_close(Archive)
+   is called before close(EntryStream), then the status goes from
+   AR_OPENED_ENTRY to AR_OPENED_ENTRY_PENDING_CLOSE -- once the
+   archive has been closed, you can't use archive_next_header() to get
+   another entry but you can continue to do I/O on the stream that was
+   created by archive_open_entry/2.
+
+   When the `ar` blob is created, it stores the ParentStream in ar->data by
    calling PL_get_stream(). This increases the reference count for
    the stream; it's decremented by PL_release_stream(ar->data).
 
@@ -118,14 +123,15 @@ the archive, the current header and some state information.
 
    When the `ar` blob is released, it needs to free the
    archive_entry struct, close the entry stream (EntryStream),
-   and close/release the archive Stream (ar->data).
+   and close/release the archive ParentStream (ar->data).
  */
+
 typedef enum ar_status
 { AR_VIRGIN = 0,
   AR_OPENED_ARCHIVE,
   AR_NEW_ENTRY,
   AR_OPENED_ENTRY,
-  AR_CLOSED_ENTRY,
+  AR_OPENED_ENTRY_PENDING_CLOSE, /* archive_close() was called when status == AR_OPENED_ENTRY_CLOSE */
   AR_ERROR
 } ar_status;
 
@@ -136,7 +142,6 @@ typedef struct archive_wrapper
   int			magic;		/* magic code */
   ar_status		status;		/* Current status */
   int			close_parent;	/* Close the parent handle */
-  int			closed_archive;	/* Archive was closed with open entry */
   struct archive *	archive;	/* Actual archive handle */
   struct archive_entry *entry;		/* Current entry */
   int			how;		/* r/w mode ('r' or 'w') */
@@ -154,6 +159,26 @@ ar_set_status_error(archive_wrapper *ar, int rc)
   return rc;
 }
 
+/* Convenience function - calls archive_read_free() or archive_write_free() as appropriate.
+   Safe to call with ar->archive == NULL.
+*/
+static int
+archive_read_or_write_free(archive_wrapper *ar)
+{ if ( !ar || ! ar->archive )
+    return ARCHIVE_FATAL;
+  { struct archive *archive_orig = ar->archive;
+    /* Prevent double free by first setting ar->archive = NULL. */
+    ar->archive = NULL;
+    /* TODO: this could use archive_free(archive_orig) */
+    switch( ar->how )
+    { case 'r': return archive_read_free(archive_orig);
+      case 'w': return archive_write_free(archive_orig);
+      case ' ': return ARCHIVE_OK;
+      default:  assert(0); return ARCHIVE_FATAL;
+    }
+  }
+}
+
 static archive_wrapper archive_wrapper_init_value =
 {
   0,			/* symbol		*/
@@ -162,24 +187,25 @@ static archive_wrapper archive_wrapper_init_value =
   ARCHIVE_MAGIC,	/* magic		*/
   AR_VIRGIN,		/* status		*/
   FALSE,		/* close_parent		*/
-  FALSE,		/* closed_archive	*/
   NULL,			/* archive		*/
   NULL,			/* entry		*/
   ' ',			/* how			*/
   FALSE			/* agc			*/
 };
 
-/* For debugging: */
+/* For debugging and for ar_permission_error(): */
 static const char*
-ar_status_str(ar_status status)
-{ switch ( status )
-  { case AR_VIRGIN:         return "AR_VIRGIN";
-    case AR_OPENED_ARCHIVE: return "AR_OPENED_ARCHIVE";
-    case AR_NEW_ENTRY:      return "AR_NEW_ENTRY";
-    case AR_OPENED_ENTRY:   return "AR_OPENED_ENTRY";
-    case AR_CLOSED_ENTRY:   return "AR_CLOSED_ENTRY";
-    case AR_ERROR:          return "AR_ERROR";
-    default:                return "AR_???";
+ar_status_str(const archive_wrapper *ar)
+{ if ( !ar )
+    return "AR_(null)";
+  switch ( ar->status )
+  { case AR_VIRGIN:                     return "AR_VIRGIN";
+    case AR_OPENED_ARCHIVE:             return "AR_OPENED_ARCHIVE";
+    case AR_NEW_ENTRY:                  return "AR_NEW_ENTRY";
+    case AR_OPENED_ENTRY:               return "AR_OPENED_ENTRY";
+    case AR_OPENED_ENTRY_PENDING_CLOSE: return "AR_OPENED_ENTRY_PENDING_CLOSE";
+    case AR_ERROR:                      return "AR_ERROR";
+    default:                            return "AR_???";
   }
 }
 
@@ -187,29 +213,25 @@ ar_status_str(ar_status status)
 #ifdef DBG
 
 static void
-dbg_ar(const char *msg, const archive_wrapper *ar)
-{
-  if (ar) {
-    Sdprintf("%-25s %p %p (got=%d) (%c) %-18s close_parent=%d closed_archive=%d symbol=%lu,reg=%d archive=%p entry=%p\n",
-             msg, ar, ar->data, ar->got_stream, ar->how, ar_status_str(ar->status),
-             ar->close_parent, ar->closed_archive,
-             (long unsigned)ar->symbol, ar->symbol_registered, ar->archive, ar->entry);
+ar_dbg(const char *msg, const archive_wrapper *ar)
+{ if ( ar )
+  { Sdprintf("%-25s %p %p (%c) %-18s close_parent=%d symbol=%lu archive=%p entry=%p\n",
+	     msg, ar, ar->data, ar->how, ar_status_str(ar),
+	     ar->close_parent, (long unsigned)ar->symbol, ar->archive, ar->entry);
     assert(ar->magic == ARCHIVE_MAGIC);
-  } else {
-    Sdprintf("%-25s %p\n", msg, ar);
+  } else
+  { Sdprintf("%-25s %p\n", msg, ar);
   }
-  Sflush(Serror);
+  /* Sflush(Serror); */
 }
 
 #else
 
 static inline void
-dbg_ar(const char *_msg, const archive_wrapper *_ar)
+ar_dbg(const char *_msg, const archive_wrapper *_ar)
 { }
 
 #endif
-
-
 
 
 		 /*******************************
@@ -272,12 +294,12 @@ int PL_existence_error3(const char* type, const char* object, term_t in)
 { term_t ex = PL_new_term_ref();
 
   if ( PL_unify_term(ex,
-                     PL_FUNCTOR, FUNCTOR_error2,
-                     PL_FUNCTOR, FUNCTOR_existence_error3,
-                     PL_CHARS, type,
-                     PL_CHARS, object,
-                     PL_TERM, in,
-                     PL_VARIABLE))
+		     PL_FUNCTOR, FUNCTOR_error2,
+		     PL_FUNCTOR, FUNCTOR_existence_error3,
+		     PL_CHARS, type,
+		     PL_CHARS, object,
+		     PL_TERM, in,
+		     PL_VARIABLE))
     return PL_raise_exception(ex);
   return FALSE;
 }
@@ -286,35 +308,75 @@ int PL_existence_error3(const char* type, const char* object, term_t in)
 		 *	  SYMBOL WRAPPER	*
 		 *******************************/
 
+static int
+ar_w_entry_alloc(archive_wrapper *ar)
+{ assert(!ar->entry);
+  switch( ar->how )
+  { case 'r':
+      /* archive_read_next_header() returns a pointer to something
+	 internal to ar->archive, so nothing to free */
+      return TRUE;
+    case 'w':
+      ar->entry = archive_entry_new();
+      if ( !ar->entry )
+	return ar_set_status_error(ar, PL_resource_error("memory"));
+      return TRUE;
+    case ' ':
+    default:
+      assert(0);
+      return FALSE;
+  }
+}
+
 static void
 ar_w_acquire_cb(atom_t symbol)
 { archive_wrapper *ar = PL_blob_data(symbol, NULL, NULL);
+  if ( !ar )
+  { ar_dbg("AR_W_ACQUIRE_CB-null", ar);
+    return;
+  }
 
   assert(ar->magic == ARCHIVE_MAGIC);
-  assert(ar->archive_free);
   assert(ar->data); /* Must have been set before PL_unify_blob() */
 
-  ar->symbol = symbol;
-  dbg_ar("ACQUIRE_ARCHIVE", ar);
+  ar->symbol = symbol; /* But don't call PL_register_atom yet */
+  ar_dbg("AR_W_ACQUIRE_CB", ar);
 }
 
 /* Callback from atom gc */
 static int
 ar_w_release_cb(atom_t symbol)
 { archive_wrapper *ar = PL_blob_data(symbol, NULL, NULL);
-  fprintf(stderr, "***RELEASE_ARCHIVE\n"); fflush(stderr);
-  dbg_ar("RELEASE_ARCHIVE", ar);
-
+  ar_dbg("AR_W_RELEASE_CB", ar);
   assert(ar->magic == ARCHIVE_MAGIC);
   ar->agc = TRUE;
 
-  /* TODO: The following assert isn't always true */
-  /* assert(ar->status != AR_OPENED_ENTRY); */
+  /* Under normal execution, archive_close/1 will have been called and
+     all the fields here will be 0 or NULL. But if archive_close/1
+     hasn't been called, then this is clean-up from garbage
+     collection.
+  */
+
+  /* TODO: Can we throw an exception if the following fails? */
+  (void)archive_read_or_write_free(ar);
 
   /* Only writeable archives have ar->entry allocated by archive_entry_new() */
   if (ar->how == 'w')
     archive_entry_free(ar->entry); /* Safe even if !ar->entry */
-  archive_free_handle(ar);
+  ar->entry = NULL;
+
+  /* TODO: what if PL_exception(0) is true? */
+
+  /* Don't do anything clever with ar->close_parent ... if there's
+     been an error, just leave the "parent" stream alone and it'll
+     eventually get cleaned up by normal garbage collection or
+     PL_cleanup(). And, because ar->data might have already been
+     cleaned up by gc, don't do anything with it. Similarly, we can't
+     do PL_release_stream(ar->data) because it might have already been
+     released but the field hasn't been null-ed. */
+
+  *ar = archive_wrapper_init_value;
+  ar_dbg("AR_W_RELEASE_CB-done", ar);
 
   return TRUE;
 }
@@ -334,7 +396,7 @@ ar_w_write_cb(IOSTREAM *s, atom_t symbol, int flags)
 { const archive_wrapper *ar = PL_blob_data(symbol, NULL, NULL);
 
   #ifdef DBG
-    Sfprintf(s, "<archive>(%p %c %s)", ar, ar->how, ar_status_str(ar->status));
+    Sfprintf(s, "<archive>(%p %c %s)", ar, ar->how, ar_status_str(ar));
   #else
     Sfprintf(s, "<archive>(%p)", ar);
   #endif
@@ -353,13 +415,15 @@ static PL_blob_t archive_blob =
 };
 
 
+/* Convenience function that adds some context info into the
+   permission error and returns FALSE. */
 static int
-permission_error_ar(const archive_wrapper *ar, const char *operation,
-                    const char *type, term_t culprit)
+ar_permission_error(const archive_wrapper *ar, const char *operation,
+		    const char *type, term_t culprit)
 { char operation_extended[100];
   snprintf(operation_extended, sizeof operation_extended,
-           "%s(%c)-%s",
-           operation, ar->how, ar_status_str(ar->status));
+	   "%s-%s(%c)",
+	   operation, ar_status_str(ar), ar->how);
   return PL_permission_error(operation_extended, type, culprit);
 }
 
@@ -369,19 +433,25 @@ get_archive(term_t t, archive_wrapper **arp)
 { PL_blob_t *type;
   void *data;
 
-  if ( PL_get_blob(t, &data, NULL, &type) && type == &archive_blob)
+  if ( PL_get_blob(t, &data, NULL, &type) && type == &archive_blob && data)
   { archive_wrapper *ar = data;
     assert(ar->magic == ARCHIVE_MAGIC);
 
-    if ( ar->symbol )
-    { *arp = ar;
-
-      return TRUE;
+    switch( ar->status )
+    { case AR_OPENED_ARCHIVE:
+      case AR_NEW_ENTRY:
+      case AR_OPENED_ENTRY:
+      case AR_OPENED_ENTRY_PENDING_CLOSE:
+	*arp = ar;
+	return TRUE;
+      case AR_VIRGIN:
+      case AR_ERROR:
+	*arp = NULL;
+	return ar_set_status_error(ar, ar_permission_error(ar, "access", "closed_archive", t));
     }
-
-    return ar_set_status_error(ar, PL_permission_error("access", "closed_archive", t));
   }
 
+  *arp = NULL;
   return PL_type_error("archive", t);
 }
 
@@ -393,47 +463,30 @@ get_archive(term_t t, archive_wrapper **arp)
 
 /* Callback from archive_XXX_close() or archive_XXX_free() */
 static int
-libarchive_open_cb(struct archive *a, void *cdata)
-{ return ARCHIVE_OK;
-}
-
-/* Callback from archive_XXX_close() or archive_XXX_free() */
-/* See also ar_close_entry(), release_archive */
-static int
 libarchive_close_cb(struct archive *a, void *cdata)
 { archive_wrapper *ar = cdata;
-  dbg_ar("AR_CLOSE", ar);
-  PL_release_stream(ar->data);
-  ar->got_stream--; // DO NOT SUBMIT
-  dbg_ar("AR_CLOSE/2", ar);
-  if ( ar->close_parent && ar->archive )
-  { dbg_ar("AR_CLOSE/3", ar);
-    if ( Sgcclose(ar->data, ar->agc ? SIO_CLOSE_FORCE : 0) != 0 )
-    { archive_set_error(ar->archive, errno, "Close failed");
-      ar->data = NULL;
-      return ARCHIVE_FATAL;
-    }
-    ar->data = NULL;
-    dbg_ar("AR_CLOSE/4", ar);
-  }
-
-  return ARCHIVE_OK;				/* TBD: close_parent */
+  /* This is a no-op; archive_write_close() or archive_write_free() is
+     called from archive_close(), and there's nothing extra that needs
+     to be done here. */
+  (void)ar;
+  return ARCHIVE_OK;
 }
 
 static ssize_t
 libarchive_read_cb(struct archive *a, void *cdata, const void **buffer)
-{ const archive_wrapper *ar = cdata;
-  /* In the folowing code, Sfeof() call S__fillbuff() if the buffer is empty.
+{ archive_wrapper *ar = cdata;
+  /* In the following code, Sfeof() call S__fillbuff() if the buffer is empty.
      TODO: Why is the code written this way instead of using Sfread()?
-           One reason could be that apparently libarchive doesn't
-           provide the buffer to dump the data in so need to maintain
-           such a buffer ourselves and copy the data or use the
-           stream's buffer.  Looks a little hacky.  On the other hand,
-           there is little wrong with it and if something changes the
-           tests will tell us. */
+	   One reason could be that apparently libarchive doesn't
+	   provide the buffer to dump the data in so need to maintain
+	   such a buffer ourselves and copy the data or use the
+	   stream's buffer.  Looks a little hacky.  On the other hand,
+	   there is little wrong with it and if something changes the
+	   tests will tell us. */
+
   if ( Sfeof(ar->data) )
   { if ( Sferror(ar->data) )
-      return set_error_status(ar, -1);
+      return ar_set_status_error(ar, -1);
     return 0;
   } else
   { ssize_t bytes = ar->data->limitp - ar->data->bufp;
@@ -449,13 +502,14 @@ libarchive_read_cb(struct archive *a, void *cdata, const void **buffer)
 static ssize_t
 libarchive_write_cb(struct archive *a, void *cdata, const void *buffer, size_t n)
 { const archive_wrapper *ar = cdata;
+  ar_dbg("LIBARCHIVE_WRITE_CB", ar);
   return Sfwrite(buffer, 1, n, ar->data);
 }
 
 static la_int64_t
 libarchive_skip_cb(struct archive *a, void *cdata, la_int64_t request)
 { archive_wrapper *ar = cdata;
-  dbg_ar("AR_SKIP", ar);
+  ar_dbg("LIBARCHIVE_SKIP_CB", ar);
 
   if ( Sseek64(ar->data, request, SIO_SEEK_CUR) == 0 )
     return request;
@@ -496,7 +550,10 @@ archive_error(const archive_wrapper *ar, int rc, term_t t, const char *msg)
 { int eno = ar->archive ? archive_errno(ar->archive) : 0;
   const char *s = ar->archive ? archive_error_string(ar->archive) : NULL;
   term_t ex;
-  dbg_ar("ARCHIVE_ERROR", ar);
+  ar_dbg("ARCHIVE_ERROR", ar);
+
+  if ( PL_exception(0) )
+    return FALSE;
 
   if ( eno == 0 )
     eno = rc;
@@ -635,43 +692,36 @@ archive_open_stream(term_t data, term_t mode, term_t handle, term_t options)
 
   /* If you make any changes here, also change archive_close() */
 
-  { archive_wrapper ar_local;
-    atom_t a;
-    ar_local = archive_wrapper_init_value;
-
-    if ( !PL_unify_blob(handle, &ar_local, sizeof ar_local, &archive_blob) ||
-         !PL_get_atom_ex(handle, &a) )
-      return FALSE;
-    ar = PL_blob_data(a, NULL, NULL);
-  }
-
-  { atom_t mname;
+  { archive_wrapper ar_local = archive_wrapper_init_value;
+    atom_t mname;
     int flags;
     if ( PL_get_atom_ex(mode, &mname) )
     { if ( mname == ATOM_write )
       { ar_local.how = 'w';
-        flags = SIO_OUTPUT;
-        ar_local.archive_free = archive_write_free;
+	flags = SIO_OUTPUT;
       } else if ( mname == ATOM_read )
       { ar_local.how = 'r';
-        flags = SIO_INPUT;
-        ar_local.archive_free = archive_read_free;
+	flags = SIO_INPUT;
       } else
-      { return ar_set_status_error(ar, PL_domain_error("io_mode", mode));
+      { return ar_set_status_error(&ar_local, PL_domain_error("io_mode", mode));
       }
     } else
     { return FALSE;
     }
 
-    /* PL_get_stream() must be before PL_unify_blob so that there's
-       always a valid `data` field in the blob */
-    if ( !PL_get_stream(data, &ar_local.data, flags) ||
-         !PL_unify_blob(handle, &ar_local, sizeof ar_local, &archive_blob) ||
-         !PL_get_atom_ex(handle, &a) )
-      return FALSE;
-    ar = PL_blob_data(a, NULL, NULL);
-    ar->got_stream++; // DO NOT SUBMIT
+    { atom_t a;
+      /* PL_get_stream() must be before PL_unify_blob so that there's
+	 always a valid `data` field in the blob */
+      if ( !PL_get_stream(data, &ar_local.data, flags) ||
+	   !PL_unify_blob(handle, &ar_local, sizeof ar_local, &archive_blob) ||
+	   !PL_get_atom_ex(handle, &a) )
+	return FALSE;
+      ar = PL_blob_data(a, NULL, NULL);
+    }
   }
+
+  if ( !ar_w_entry_alloc(ar) ) // DO NOT SUBMIT -- this leaks with archive_close/1
+    return FALSE;
 
   while( PL_get_list_ex(tail, head, tail) )
   { atom_t name;
@@ -686,10 +736,10 @@ archive_open_stream(term_t data, term_t mode, term_t handle, term_t options)
       if ( !PL_get_atom_ex(arg, &c) )
 	return FALSE;
       if ( ar->how == 'w' && ((ar->type & FILTER_MASK) != 0) )
-        return ar_set_status_error(ar, PL_permission_error("set", "filter", arg));
+	return ar_set_status_error(ar, ar_permission_error(ar, "set", "filter", arg));
       if ( c == ATOM_all )
       { if (ar->how == 'w')
-          return ar_set_status_error(ar, PL_domain_error("write_filter", arg));
+	  return ar_set_status_error(ar, PL_domain_error("write_filter", arg));
 	ar->type |= FILTER_ALL;
       }
 #ifdef FILTER_BZIP2
@@ -748,10 +798,10 @@ archive_open_stream(term_t data, term_t mode, term_t handle, term_t options)
       if ( !PL_get_atom_ex(arg, &f) )
 	return FALSE;
       if ( ar->how == 'w' && (( ar->type & FORMAT_MASK ) != 0 ) )
-        return ar_set_status_error(ar, PL_permission_error("set", "format", arg));
+	return ar_set_status_error(ar, ar_permission_error(ar, "set", "format", arg));
       if ( f == ATOM_all )
       { if ( ar->how == 'w' )
-          return ar_set_status_error(ar, PL_domain_error("write_format", arg));
+	  return ar_set_status_error(ar, PL_domain_error("write_format", arg));
 	ar->type |= FORMAT_ALL;
       }
 #ifdef FORMAT_7ZIP
@@ -923,7 +973,7 @@ archive_open_stream(term_t data, term_t mode, term_t handle, term_t options)
 #endif
      }
      archive_read_set_callback_data(ar->archive, ar);
-     archive_read_set_open_callback(ar->archive, libarchive_open_cb);
+     /* open callback is "legacy ... and should not be used" */
      archive_read_set_read_callback(ar->archive, libarchive_read_cb);
      archive_read_set_skip_callback(ar->archive, libarchive_skip_cb);
 #ifdef HAVE_ARCHIVE_READ_SET_SEEK_CALLBACK
@@ -931,14 +981,18 @@ archive_open_stream(term_t data, term_t mode, term_t handle, term_t options)
 #endif
      archive_read_set_close_callback(ar->archive, libarchive_close_cb);
 
-     if ( (rc=archive_read_open1(ar->archive)) == ARCHIVE_OK )
-     { ar->status = AR_OPENED_ARCHIVE;
-       return TRUE;
+     { int rc = archive_read_open1(ar->archive);
+       if ( rc == ARCHIVE_OK )
+       { ar->status = AR_OPENED_ARCHIVE;
+	 return TRUE;
+      } else
+      { return ar_set_status_error(ar, archive_error(ar, rc, data, "archive_read_open1"));
+      }
      }
   } else if ( ar->how == 'w' )
   { if ( !(ar->archive = archive_write_new()) )
       return ar_set_status_error(ar, PL_resource_error("memory"));
-     /* Prevent libarchive from padding the last block to 10240 bytes. Some decompressors,
+    /* Prevent libarchive from padding the last block to 10240 bytes. Some decompressors,
        notably Oracle's jar decompressor, fail when presented with this */
     archive_write_set_bytes_in_last_block(ar->archive, 1);
     if (0) {}
@@ -997,11 +1051,15 @@ archive_open_stream(term_t data, term_t mode, term_t handle, term_t options)
     { return ar_set_status_error(ar, PL_existence_error3("option", "filter", options));
     }
 #endif
-    if ( (rc=archive_write_open(ar->archive, ar,
-				libarchive_open_cb, libarchive_write_cb, libarchive_close_cb)) == ARCHIVE_OK )
-    { ar->status = AR_OPENED_ARCHIVE;
-      return TRUE;
-    }
+     { int rc = archive_write_open(ar->archive, ar,
+				   NULL, libarchive_write_cb, libarchive_close_cb);
+       if ( rc == ARCHIVE_OK )
+       { ar->status = AR_OPENED_ARCHIVE;
+	 return TRUE;
+       } else
+       { return ar_set_status_error(ar, archive_error(ar, rc, data, "archive_write_open"));
+       }
+     }
   } else {
     assert(0); /* ar->how isn't 'r' or 'w' */
     return FALSE;
@@ -1047,24 +1105,27 @@ archive_next_header(term_t archive, term_t name)
   int rc;
 
   if ( !get_archive(archive, &ar) )
+  { ar_dbg("ARCHIVE_NEXT_HEADER", NULL);
     return FALSE;
-  dbg_ar("ARCHIVE_NEXT_HEADER", ar);
-  if ( ar->status != AR_OPENED_ARCHIVE &&
-       ar->status != AR_NEW_ENTRY )
-    return set_error_status(ar, permission_error_ar(ar, "next_header", "archive", archive));
+  }
+  ar_dbg("ARCHIVE_NEXT_HEADER", ar);
+  // DO NOT SUBMIT: switch( ar->status )
+  switch ( ar->status )
+  { case AR_OPENED_ARCHIVE:
+    case AR_NEW_ENTRY:
+      break;
+    case AR_VIRGIN:
+    case AR_OPENED_ENTRY:
+    case AR_OPENED_ENTRY_PENDING_CLOSE:
+    case AR_ERROR:
+      return ar_set_status_error(ar, ar_permission_error(ar, "next_header", "archive", archive));
+  }
 
   if ( ar->how == 'w' )
   { char* pathname = NULL;
-    if ( ar->status == AR_OPENED_ENTRY )
-      return ar_set_status_error(ar, PL_permission_error("next_header", "archive", archive));
     if ( !PL_get_atom_chars(name, &pathname) )
       return ar_set_status_error(ar, PL_type_error("atom", name));
-    if ( ar->entry )
-      archive_entry_clear(ar->entry);
-    else
-      ar->entry = archive_entry_new();
-    if ( !ar->entry )
-      return ar_set_status_error(ar, PL_resource_error("memory"));
+    archive_entry_clear(ar->entry);
     archive_entry_set_pathname(ar->entry, pathname);
     /* libarchive-3.1.2 does not tolerate an empty size with zip. Later versions may though - it is fixed in git as of Dec 2013.
      *    For now, set the other entries to a sensible default
@@ -1073,63 +1134,120 @@ archive_next_header(term_t archive, term_t name)
     archive_entry_set_filetype(ar->entry, AE_IFREG);
     archive_entry_set_perm(ar->entry, 0644);
     ar->status = AR_NEW_ENTRY;
-    dbg_ar("ARCHIVE_NEXT_HEADER/2", ar);
     return TRUE;
   }
   assert(ar->how == 'r');
-  if ( ar->status != AR_OPENED_ARCHIVE )
+  if ( ar->status == AR_NEW_ENTRY )
   { if ( (rc=archive_read_data_skip(ar->archive)) != ARCHIVE_OK )
-      return set_error_status(ar, archive_error(ar, rc, archive, "archive_read_data_skip"));
-  } else if ( ar->status == AR_OPENED_ENTRY )
-  { return ar_set_status_error(ar, PL_permission_error("next_header", "archive", archive));
-  }
+      return ar_set_status_error(ar, archive_error(ar, rc, archive, "archive_read_data_skip"));
+  } else
+    assert(ar->status == AR_OPENED_ARCHIVE);
 
   while ( (rc=archive_read_next_header(ar->archive, &ar->entry)) == ARCHIVE_OK )
-  { if ( PL_unify_wchars(name, PL_ATOM, -1,
+  { if ( PL_exception(0) ) /* shouldn't happen, but the callbacks are complicated */
+    { ar->status = AR_ERROR;
+      return FALSE;
+    }
+    if ( PL_unify_wchars(name, PL_ATOM, -1,
 			 archive_entry_pathname_w(ar->entry)) )
     { ar->status = AR_NEW_ENTRY;
-      dbg_ar("ARCHIVE_NEXT_HEADER/3", ar);
       return TRUE;
     }
-    if ( PL_exception(0) )
+    if ( PL_exception(0) ) /* e.g. resource error in PL_unify_wchars */
       return FALSE;
   }
 
   if ( rc == ARCHIVE_EOF )
+  { ar->status = AR_OPENED_ARCHIVE;
     return FALSE;			/* simply at the end */
+  }
 
-  return set_error_status(ar, archive_error(ar, rc, archive, "archive_read_next_header"));
+  return ar_set_status_error(ar, archive_error(ar, rc, archive, "archive_read_next_header"));
 }
 
+
+/* Called from archive_close() [Prolog archive_close/1] or
+   ar_entry_close_cb() [Prolog close/1] */
+static int /* 0 for success, -1 for error */
+archive_close_(archive_wrapper *ar)
+{ int success = 0;
+  ar_dbg("ARCHIVE_CLOSE_", ar);
+  if ( !ar )
+  { errno = EFAULT;
+    return -1;
+  }
+
+  /* This is the inverse of archive_open_stream().
+     It's essentially the same as ar_w_clear(), except it also sets
+     error statuses, because it's being called from Prolog. */
+
+  /* TODO: set error indication (errno, Sseterr(), Sset_exception() */
+
+  switch( ar->status )
+  { case AR_VIRGIN:
+    case AR_NEW_ENTRY:
+    case AR_ERROR:
+    case AR_OPENED_ENTRY_PENDING_CLOSE:
+      errno = EBADF;
+      success = -1;
+      break;
+    case AR_OPENED_ARCHIVE:
+      break;
+    case AR_OPENED_ENTRY:
+      ar->status = AR_OPENED_ENTRY_PENDING_CLOSE;
+      /* ar_entry_close_cb() will call archive_close_() with status
+	 AR_OPENED_ARCHIVE if AR_OPENED_ENTRY_PENDING_CLOSE. */
+      return TRUE;
+  }
+
+  /* archive_read_or_write_free() flushes the archive buffers, so must
+     be done while the ParentStream (ar->data) is still open. */
+  if ( archive_read_or_write_free(ar) != ARCHIVE_OK )
+  { errno = EFAULT;
+    success = -1;
+  }
+  ar->archive = NULL;
+
+  /* Only writeable archives have ar->entry allocated by archive_entry_new() */
+  if (ar->how == 'w')
+    archive_entry_free(ar->entry); /* Safe even if !ar->entry */
+  ar->entry = NULL;
+
+  if ( ar->data )
+  { IOSTREAM *ar_data_orig = ar->data;
+    ar->data = NULL;
+    PL_release_stream(ar_data_orig);
+
+    if ( ar->close_parent )
+    { if ( Sgcclose(ar_data_orig, ar->agc ? SIO_CLOSE_FORCE : 0) != 0 )
+      { archive_set_error(ar->archive, errno, "Close failed");
+	success = -1;
+      }
+    }
+  }
+
+  if ( success == 0 )
+    ar->status = AR_VIRGIN;
+  else
+    ar->status = AR_ERROR;
+
+  return success;
+}
 
 static foreign_t
 archive_close(term_t archive)
 { archive_wrapper *ar;
-  int rc;
-  dbg_ar("ARCHIVE_CLOSE/0", NULL);
-
   if ( !get_archive(archive, &ar) )
+  { ar_dbg("ARCHIVE_CLOSE", NULL);
     return FALSE;
-  dbg_ar("ARCHIVE_CLOSE", ar);
-
-  if ( ar->status == AR_OPENED_ENTRY )
-  { ar->closed_archive = TRUE;
-
-    return TRUE;
-  } else if ( (rc=ar->archive_free(ar->archive)) == ARCHIVE_OK )
-  { ar->entry = NULL;
-    ar->archive = NULL;
-    ar->symbol = 0;
-    ar->status = AR_CLOSED_ENTRY;
-
-    return TRUE;
   }
+  ar_dbg("ARCHIVE_CLOSE", ar);
 
-  ar->archive = NULL; /* archive_error() can't use ar->archive */
-  ar->entry = NULL;
-  ar->symbol = 0;
-  ar->status = AR_ERROR;
-  return set_error_status(ar, archive_error(ar, rc, archive, "archive_free"));
+  (void)archive_close_(ar);
+  if ( PL_exception(0) )
+    PL_clear_exception();
+
+  return TRUE;
 }
 
 		 /*******************************
@@ -1147,8 +1265,9 @@ archive_header_prop_(term_t archive, term_t field)
   if ( !PL_get_functor(field, &prop) )
     return ar_set_status_error(ar, PL_type_error("compound", field));
   if ( ar->status != AR_NEW_ENTRY )
-    return ar_set_status_error(ar, PL_permission_error("access", "archive_entry", archive));
-
+    return ar_set_status_error(ar, ar_permission_error(ar, "access", "archive_entry", archive));
+  if ( ar->how != 'r' )
+    return ar_set_status_error(ar, ar_permission_error(ar, "read", "archive_entry", archive));
   if ( prop == FUNCTOR_filetype1 )
   { __LA_MODE_T type = archive_entry_filetype(ar->entry);
     atom_t name;
@@ -1186,7 +1305,7 @@ archive_header_prop_(term_t archive, term_t field)
     switch(type&AE_IFMT)
     { case AE_IFLNK:
 	target = archive_entry_symlink_w(ar->entry);
-        break;
+	break;
     }
 
     if ( target )
@@ -1207,15 +1326,14 @@ archive_header_prop_(term_t archive, term_t field)
   { const char *s = archive_format_name(ar->archive);
 
     if ( s )
-    { char lwr[50];
+    { char lwr[100];
       char *o;
       term_t arg = PL_new_term_ref();
+      strncpy(lwr, s, sizeof lwr - 1);
+      lwr[sizeof lwr - 1] = '\0';
+      for(o=lwr; *o; ++o)
+	*o = tolower(*o);
       _PL_get_arg(1, field, arg);
-
-      for(o=lwr; *s && o < lwr+sizeof(lwr); )
-	*o++ = tolower(*s++);
-
-      *o = '\0';
 
       return PL_unify_atom_chars(arg, lwr);
     }
@@ -1235,9 +1353,9 @@ archive_set_header_property(term_t archive, term_t field)
   if ( !PL_get_functor(field, &prop) )
     return ar_set_status_error(ar, PL_type_error("compound", field));
   if ( ar->status != AR_NEW_ENTRY )
-    return ar_set_status_error(ar, PL_permission_error("access", "archive_entry", archive));
+    return ar_set_status_error(ar, ar_permission_error(ar, "access", "archive_entry", archive));
   if ( ar->how != 'w' )
-    return ar_set_status_error(ar, PL_permission_error("write", "archive_entry", archive));
+    return ar_set_status_error(ar, ar_permission_error(ar, "write", "archive_entry", archive));
 
   if ( prop == FUNCTOR_filetype1 )
   { atom_t name;
@@ -1297,6 +1415,20 @@ archive_set_header_property(term_t archive, term_t field)
 static ssize_t
 ar_entry_read_cb(void *handle, char *buf, size_t size)
 { const archive_wrapper *ar = handle;
+  ar_dbg("AR_ENTRY_READ_CB", ar);
+  if ( !ar || ! ar->archive )
+    return -1;
+
+  switch( ar->status )
+  { case AR_VIRGIN:
+    case AR_OPENED_ARCHIVE:
+    case AR_NEW_ENTRY:
+    case AR_ERROR:
+      return -1;
+    case AR_OPENED_ENTRY:
+    case AR_OPENED_ENTRY_PENDING_CLOSE:
+      break;
+  }
 
   return archive_read_data(ar->archive, buf, size);
 }
@@ -1304,6 +1436,21 @@ ar_entry_read_cb(void *handle, char *buf, size_t size)
 static ssize_t
 ar_entry_write_cb(void *handle, char *buf, size_t size)
 { const archive_wrapper *ar = handle;
+  ar_dbg("AR_ENTRY_WRITE_CB", ar);
+
+  if ( !ar || ! ar->archive )
+    return -1;
+
+  switch( ar->status )
+  { case AR_VIRGIN:
+    case AR_OPENED_ARCHIVE:
+    case AR_NEW_ENTRY:
+    case AR_ERROR:
+      return -1;
+    case AR_OPENED_ENTRY:
+    case AR_OPENED_ENTRY_PENDING_CLOSE:
+      break;
+  }
 
   size_t written = archive_write_data(ar->archive, buf, size);
   /* In older version of libarchive (at least until 3.1.12), archive_write_data returns 0 for
@@ -1318,35 +1465,64 @@ ar_entry_write_cb(void *handle, char *buf, size_t size)
 }
 
 /* Callback from Prolog close/1 */
-/* See also ar_close(), release_archive */
+/* See also libarchive_close_cb(), ar_w_release_cb() */
 static int
 ar_entry_close_cb(void *handle)
-{ archive_wrapper *ar = handle;
-  dbg_ar("AR_CLOSE_ENTRY", ar);
-  if ( ar->closed_archive )
-  { if ( ar->archive )
-    { int rc;
+{ int success = 0;
+  archive_wrapper *ar = handle;
+  ar_dbg("AR_ENTRY_CLOSE_CB", ar);
+  /* This is the inverse of archive_open_entry/2, and is called from
+     ar_entry_close_cb(), by Prolog's close(EntryStream). The
+     EntryStream is derived from the stream used to create the archive
+     and will be taken care of by archive_close(Archive), which will
+     close ar->data.
+  */
+  if ( !ar )
+    return -1;
 
-      if ( (rc=ar->archive_free(ar->archive)) == ARCHIVE_OK )
-      { ar->entry = NULL;
-	ar->archive = NULL;
-	ar->symbol = 0;
-        ar->status = AR_CLOSED_ENTRY;
-      } else
+  /* It is possible that archive_close(Archive) was called before
+     close(EntryStream) - see the archive_open_named/3 example in the
+     documentation for archive_close/1. If archive_close(Archive) has
+     been called, the state is AR_OPENED_ENTRY_PENDING_CLOSE; if not,
+     the state is AR_OPENED_ENTRY; all other states are an error.
+   */
+  switch( ar->status )
+  { case AR_VIRGIN:
+    case AR_OPENED_ARCHIVE:
+    case AR_NEW_ENTRY:
+    case AR_ERROR:
+      return -1; /* TODO: throw an error? */
+    case AR_OPENED_ENTRY:
+      break;
+    case AR_OPENED_ENTRY_PENDING_CLOSE:
+      break;
+  }
+
+  switch( ar->how )
+  { case 'w':
+      if ( ar->archive && ARCHIVE_OK != archive_write_finish_entry(ar->archive) )
       { ar->status = AR_ERROR;
-        dbg_ar("AR_CLOSE_ENTRY/2", ar);
-	return -1;
+	/* TODO: PL_exception(0) and/or archive_error()? */
+	success = -1;
       }
-    }
+      break;
+    case 'r':
+    case ' ':
+      break;
   }
-  if ( ar->status == AR_OPENED_ENTRY )
-  { PL_unregister_atom(ar->symbol);
-    ar->symbol_registered--; // DO NOT SUBMIT
-    dbg_ar("AR_CLOSE_ENTRY/3", ar);
+
+  if ( ar->status == AR_OPENED_ENTRY_PENDING_CLOSE )
+    { /* Re-do archive_close(), this time as if the close(EntryStream)
+	 has been done. */
     ar->status = AR_OPENED_ARCHIVE;
+    success = archive_close_(ar);
   }
-  dbg_ar("AR_CLOSE_ENTRY/4", ar);
-  return 0;
+
+  ar_dbg("AR_ENTRY_CLOSE_CB/2", ar);
+  PL_unregister_atom(ar->symbol);
+
+  ar->status = AR_OPENED_ARCHIVE;
+  return success;
 }
 
 static int
@@ -1394,46 +1570,53 @@ archive_open_entry(term_t archive, term_t stream)
   /* If you make changes here, be sure to also change ar_entry_close() */
 
   if ( !get_archive(archive, &ar) )
+  { ar_dbg("ARCHIVE_OPEN_ENTRY", NULL);
     return FALSE;
-  dbg_ar("ARCHIVE_OPEN_ENTRY", ar);
-  if ( !(ar->status == AR_NEW_ENTRY) )
-    return set_error_status(ar, permission_error_ar(ar, "access", "archive_entry", archive));
-  if ( ar->how == 'r' )
-  { if ( (entry_data=Snew(ar, SIO_INPUT|SIO_RECORDPOS, &ar_entry_read_functions)) )
-    { ar->status = AR_OPENED_ENTRY;
-      if ( PL_unify_stream(stream, entry_data) )
-      { PL_register_atom(ar->symbol);	/* We may no longer reference the */
-        ar->symbol_registered++; // DO NOT SUBMIT
-        return TRUE;			/* archive itself */
-      }
-      Sclose(entry_data);
-      return FALSE;
-    }
-  } else if ( ar->how == 'w' )
-  { /* First we must finalize the header before trying to write the data */
-    if ( ar->status == AR_NEW_ENTRY )
-    { archive_write_header(ar->archive, ar->entry);
-      archive_entry_free(ar->entry);
-      ar->entry = NULL;
-    } else
-    { return ar_set_status_error(ar, PL_permission_error("access", "archive_entry", archive));
-    }
-    /* Then we can make a handle for the data */
-    if ( (entry_data=Snew(ar, SIO_OUTPUT|SIO_RECORDPOS, &ar_entry_write_functions)) )
-    { ar->status = AR_OPENED_ENTRY;
-      if ( PL_unify_stream(stream, entry_data) )
-      { PL_register_atom(ar->symbol);	/* We may no longer reference the */
-        ar->symbol_registered++; // DO NOT SUBMIT
-        return TRUE;			/* archive itself */
-      }
-      Sclose(entry_data);
-      return FALSE;
-    }
-  } else {
-    assert(0); /* ar->how isn't 'r' or 'w' */
+  }
+  ar_dbg("ARCHIVE_OPEN_ENTRY", ar);
+  switch( ar->status )
+  { case AR_VIRGIN:
+    case AR_OPENED_ARCHIVE:
+    case AR_OPENED_ENTRY:
+    case AR_OPENED_ENTRY_PENDING_CLOSE:
+    case AR_ERROR:
+      return ar_set_status_error(ar, ar_permission_error(ar, "access", "archive_entry", archive));
+    case AR_NEW_ENTRY:
+      break;
   }
 
-  return set_error_status(ar, PL_resource_error("memory"));
+  switch ( ar->how )
+  { case 'r':
+      entry_data = Snew(ar, SIO_INPUT|SIO_RECORDPOS, &ar_entry_read_functions);
+      break;
+    case 'w':
+    { /* Finalize the header before trying to write the data */
+      int rc = archive_write_header(ar->archive, ar->entry);
+      if ( rc != ARCHIVE_OK )
+	return ar_set_status_error(ar, archive_error(ar, rc, archive, "archive_write_header"));
+      /* Then we can make a handle for the data */
+      entry_data = Snew(ar, SIO_OUTPUT|SIO_RECORDPOS, &ar_entry_write_functions);
+    }
+    break;
+  default:
+    assert(0);
+    entry_data = NULL;
+  }
+  if ( entry_data )
+  { if ( PL_unify_stream(stream, entry_data) )
+    { PL_register_atom(ar->symbol);	/* Make sure archive's stream isn't gc-ed  */
+      ar->status = AR_OPENED_ENTRY;
+      return TRUE;			/* archive itself */
+    }
+
+    if ( Sgcclose(entry_data, ar->agc ? SIO_CLOSE_FORCE : 0) != 0 )
+    { archive_set_error(ar->archive, errno, "Close failed");
+    }
+    ar->status = AR_ERROR;
+    return FALSE;
+  }
+
+  return ar_set_status_error(ar, PL_resource_error("memory")); /* The only reason why Snew() fails */
 }
 
 

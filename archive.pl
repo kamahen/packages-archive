@@ -95,18 +95,50 @@ Here is another example which counts the files in the archive and prints
 file  type  information, also using archive_foldl/4:
 
   ```
-  print_entry(Path, Handle, Cnt0, Cnt1) :-
-      archive_header_property(Handle, filetype(Type)),
-      format('File ~w is of type ~w~n', [Path, Type]),
-      Cnt1 is Cnt0 + 1.
-
   list_archive_headers(File) :-
       archive_foldl(print_entry, File, 0, FileCount),
-      format('We have ~w files', [FileCount]).
+      format('There are ~w files', [FileCount]).
+
+  print_entry(Path, Handle, Cnt0, Cnt1) :-
+      maplist(archive_header_property(Handle),
+              [filetype(Type), size(Size), permissions(Permissions), mtime(Mtime)]),
+      format_time(string(MtimeStr), '%d %b %Y %T %z', Mtime),
+      format('~|File ~w~t~30| type(~w) permissions(~|~`0t~8r~4+)~|~t~d~6+ bytes ~w~n',
+             [Path, Type, Permissions, Size, MtimeStr]),
+      Cnt1 is Cnt0 + 1.
   ```
 
-@see https://github.com/libarchive/libarchive/
-*/
+The normal way of calling the predicates is:
+```
+archive_open_stream(ParentStream, read, Archive, []),
+repeat:
+  archive_next_header(Archive, Name),
+  archive_header_property(Archive, Property),
+  archive_open_entry(Archive, EntryStream),
+  <read from EntryStream>
+  close(EntryStream),
+archive_close(Archive),
+close(ParentStream)
+```
+
+For writing,  it's similar, except  for `write` mode instead  of `read`,
+archive_set_header_property/2 instead  of archive_header_property/2, and
+writing  to   EntryStream.   If   you  don't   call  close(EntryStream),
+archive_close(Archive), or close(ParentStream) can lead to corruption of
+the  archive  (if close_parent(true)  is  specified  in the  options  to
+archive_open/4, the close(ParentStream) can be omitted).
+
+For  both reading  and writing,  if close_parent(bool)  is specified  in
+archive_open_stream/4,    the    close(ParentStream)    is    done    by
+archive_close(Archive)   -  and   archive_open/4  implicitly   specifies
+close_parent(bool) if given a file path.
+
+If   you're   working   with   only  a   single   entry   (no   repeated
+archive_next_header/2, the archive_close(Archive) can be done before the
+close(EntryStream)  -   see  archive_close/2   and  its   definition  of
+archive_open_named/3 for details.
+
+@see https://github.com/libarchive/libarchive/ */
 
 :- use_foreign_library(foreign(archive4pl)).
 
@@ -132,7 +164,7 @@ archive_open(Stream, Archive, Options) :-
 %!  archive_open(+Data, +Mode, -Archive, +Options) is det.
 %
 %   Open the  archive in  Data and  unify Archive with  a handle  to the
-%   opened archive.  Data is either a  file name (as accepted by open/4)
+%   opened archive.  Data is either a  file path (as accepted by open/4)
 %   or a stream  that has been opened with the  option type(binary).  If
 %   Data  is an  already  open  stream, the  caller  is responsible  for
 %   closing it  (but see option  close_parent(true)) and must  not close
@@ -146,6 +178,18 @@ archive_open(Stream, Archive, Options) :-
 %   contain explicit  entries (e.g.,  gzip'ed data)  unambibuously.  The
 %   =raw=  format creates  a _pseudo  archive_ holding  a single  member
 %   named =data=.
+%
+%   Appending  to an  archive is  not supported  because the  underlying
+%   `libarchive` does not support append (even though some formats, such
+%   as `zip` or uncompressed `gnutar`  do support append). If you open/4
+%   a stream  in `append` mode,  you will probably create  an unreadable
+%   archive.
+%
+%   If the mode is =write=, archive_close/1 must be called on Archive to
+%   ensure that  there is no  data loss  corruption, and must  be called
+%   before   the  Data   stream  is   closed.   If  you   do  not   call
+%   archive_close/1, garbage collection or  system shutdown will attempt
+%   to close the archive, but may result in data loss or corruption.
 %
 %     * close_parent(+Boolean)
 %     If this option is =true=  (default =false=), Data stream is closed
@@ -182,8 +226,9 @@ archive_open(Stream, Archive, Options) :-
 %   permission error if  the (explicitly) requested format  or filter is
 %   not supported.
 %
-%   @error  domain_error if the Mode or an option isn't one of the possible values.
-%   @error  existence_permission_error if a format or filter isn't supported
+%   @error  domain_error if the Mode or an option isn't one of the possible values
+%           or if a requested filter is invalid (e.g., `all` for writing).
+%   @error  permission_error if a format or filter isn't supported
 %           for the file.
 %   @error  existence_error if the format or filter isn't supported
 %           in general.
@@ -204,17 +249,18 @@ archive_open(File, Mode, Archive, Options) :-
 %!  archive_close(+Archive) is det.
 %
 %   Close  the   archive.   If   close_parent(true)  was   specified  in
-%   archive_open/4, the underlying entry stream  is closed too. If there
-%   is an  entry opened with archive_open_entry/2,  actually closing the
-%   archive is  delayed until  the stream associated  with the  entry is
-%   closed.   This can  be used  to open  a stream  to an  archive entry
-%   without having to worry about closing the archive:
+%   archive_open/4,  the  underlying entry  stream  that  was passed  to
+%   archive_open/4  is closed  also. If  there is  an entry  opened with
+%   archive_open_entry/2, actually closing the  archive is delayed until
+%   the stream associated with the entry is closed.  This can be used to
+%   open a  stream to  an archive  entry without  having to  worry about
+%   closing the archive:
 %
 %     ```
-%     archive_open_named(ArchiveFile, EntryName, Stream) :-
-%         archive_open(ArchiveFile, Archive, []),
+%     archive_open_named(ArchiveFile, EntryName, EntryStream) :-
+%         archive_open(ArchiveFile, Archive, []), % implicit close_parent(true)
 %         archive_next_header(Archive, EntryName),
-%         archive_open_entry(Archive, Stream),
+%         archive_open_entry(Archive, EntryStream),
 %         archive_close(Archive).
 %     ```
 
@@ -260,9 +306,15 @@ defined_archive_property(filter(_)).
 
 %!  archive_open_entry(+Archive, -Stream) is det.
 %
-%   Open the current entry as a stream. Stream must be closed.
-%   If the stream is not closed before the next call to
-%   archive_next_header/2, a permission error is raised.
+%   Open the current  entry as a stream. Stream must  be closed.  If the
+%   stream is not closed before  the next call to archive_next_header/2,
+%   a permission error is raised.
+%
+%   If the  mode is  =write=, close/1  must be called  on the  Stream to
+%   ensure that  there is no  data loss  corruption, and must  be called
+%   before  the Data  stream is  closed. Garbage  collection and  system
+%   shutdown will attempt  to close the archive, but may  result in data
+%   loss or corruption.
 %
 %   @error permission_error if the Archive isn't in an appropriate state.
 
@@ -274,18 +326,18 @@ defined_archive_property(filter(_)).
 %
 %     * filetype(-Type)
 %     Type is one of =file=, =link=, =socket=, =character_device=,
-%     =block_device=, =directory= or =fifo=.  It appears that this
-%     library can also return other values.  These are returned as
-%     an integer.
+%     =block_device=, =directory= or =fifo=.
 %     * mtime(-Time)
-%     True when entry was last modified at time.
+%     True when entry was last modified at time (as returned
+%     by get_time/1).
 %     * size(-Bytes)
 %     True when entry is Bytes long.
 %     * link_target(-Target)
 %     Target for a link. Currently only supported for symbolic
 %     links.
 %
-%   @error permission_error if the Archive isn't in an appropriate state.
+%   @error permission_error if the Archive isn't in an appropriate state:
+%     a write-archive immediately after archive_next_header/2.
 
 %!  archive_header_property(+Archive, ?Property)
 %
@@ -294,11 +346,10 @@ defined_archive_property(filter(_)).
 %
 %     * filetype(-Type)
 %     Type is one of =file=, =link=, =socket=, =character_device=,
-%     =block_device=, =directory= or =fifo=.  It appears that this
-%     library can also return other values.  These are returned as
-%     an integer.
-%     * mtime(-Time)
-%     True when entry was last modified at time.
+%     =block_device=, =directory= or =fifo=.
+%     * mtime(-TimeStamp)
+%     True when entry was last modified at time stamp (as returned
+%     by get_time/1).
 %     * size(-Bytes)
 %     True when entry is Bytes long.
 %     * link_target(-Target)
@@ -307,11 +358,12 @@ defined_archive_property(filter(_)).
 %     * format(-Format)
 %     Provides the name of the archive format applicable to the
 %     current entry.  The returned value is the lowercase version
-%     of the output of archive_format_name().
+%     of the output of `libarchive`'s archive_format_name().
 %     * permissions(-Integer)
 %     True when entry has the indicated permission mask.
 %
-%   @error permission_error if the Archive isn't in an appropriate state.
+%   @error permission_error if the Archive isn't in an appropriate state:
+%     a read-archive immediately after archive_next_header/2.
 
 archive_header_property(Archive, Property) :-
     (   nonvar(Property)
