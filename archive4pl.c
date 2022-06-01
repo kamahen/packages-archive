@@ -57,46 +57,62 @@
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 		Design of the libarchive interface
 
-An archive is represented by a   symbol (blob). The C-structure contains
+An archive is represented by a symbol (blob). The C-structure contains
 the archive, the current header and some state information.
-- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-#define ARCHIVE_MAGIC 348184378
+There are three kinds of "callbacks" (all indicated by the suffix
+"_cb" in their names:
+- Prolog blob: ar_w_{release,compare,write,acquire}_cb
+- Prolog stream: ar_entry_{read,write,close,control}_cb
+- libarchive "client": libarchive_{read,skip,seek,close}_cb
 
-/* The normal way of calling the predicates.  [`ar` is the archive_wrapper blob]
+The foreign functions called from Prolog have the prefix "cffi_". This
+is to avoid confusiong with the various archive_* functions provided
+by libarchive.
+
+The normal way of calling the predicates [`ar` is the archive_wrapper blob]:
 
    For reading (ar->entry is allocated by archive_read_next_header):
-     archive_open_stream(ParentStream, read,
-                         Archive, Options),      % AR_VIRGIN -> AR_OPENED_ARCHIVE
+     cffi_archive_open_stream(ParentStream, read,
+                              Archive, Options),      % AR_VIRGIN -> AR_OPENED_ARCHIVE
      repeat:
-       archive_next_header(Archive, Name),       % AR_OPENED_ARCHIVE -> AR_NEW_ENTRY
-       archive_header_property(Archive, Property),
-       archive_open_entry(Archive, EntryStream), % AR_NEW_ENTRY -> AR_OPENED_ENTRY
+       cffi_archive_next_header(Archive, Name),       % AR_OPENED_ARCHIVE -> AR_NEW_ENTRY
+       cffi_archive_header_property(Archive, Property),
+       cffi_archive_open_entry(Archive, EntryStream), % AR_NEW_ENTRY -> AR_OPENED_ENTRY
        <read from EntryStream>
        close(EntryStream), % ar_entry_close_cb() % AR_OPENED_ENTRY _> AR_OPENED_ARCHIVE
-     archive_close(Archive),                     % ... -> AR_VIRGIN or AR_OPENED_ENTRY_PENDING_CLOSE
-     close(ParentStream)                         % done implicitly by archive_close(Archive) if close_parent(true)
+     cffi_archive_close(Archive),                     % ... -> AR_VIRGIN or AR_OPENED_ENTRY_PENDING_CLOSE
+     close(ParentStream)                              % done implicitly by cffi_archive_close(Archive) if close_parent(true)
 
    It's similar for writing (ar->entry is allocated by
-   archive_entry_new()), except for `write` mode instead of `read`,
-   archive_set_header_property/2 instead of archive_header_property/2,
-   and writing to EntryStream.
+   cffi_archive_entry_new()), except for `write` mode instead of
+   `read`, cffi_archive_set_header_property/2 instead of
+   cffi_archive_header_property/2, and writing to EntryStream.
 
-   If close_parent(bool) is specified in archive_open_stream/4, the
-   close(EntryStrea
+   Not shown are the various callbacks from either libarchive.  For
+   example, when cffi_archive_open_stream() calls
+   archive_open_read1(), there is a callback to libarchive_read_cb(),
+   which then uses the IOSTREAM.
 
-   For both reading and writing an archive, if archive_close(Archive)
-   is called before close(EntryStream), then the status goes from
-   AR_OPENED_ENTRY to AR_OPENED_ENTRY_PENDING_CLOSE -- once the
-   archive has been closed, you can't use archive_next_header() to get
-   another entry but you can continue to do I/O on the stream that was
-   created by archive_open_entry/2.
+   If close_parent(bool) is specified in archive_open_stream/4
+   (cffi_archive_open_stream), the close(EntryStream) is delayed until
+   cffi_archive_close(Archive) is called - this is indicated by state
+   AR_OPENED_ENTRY_PENDING_CLOSE.
 
-   When the `ar` blob is created, it stores the ParentStream in ar->data by
-   calling PL_get_stream(). This increases the reference count for
-   the stream; it's decremented by PL_release_stream(ar->data).
+   For both reading and writing an archive, if
+   cffi_archive_close(Archive) is called before close(EntryStream),
+   then the status goes from AR_OPENED_ENTRY to
+   AR_OPENED_ENTRY_PENDING_CLOSE -- once the archive has been closed,
+   you can't use cffi_archive_next_header() to get another entry but
+   you can continue to do I/O on the stream that was created by
+   archive_open_entry/2.
 
-   When an EntryStream is created (by archive_open_entry/2) and a
+   When the blob is created (`ar`), it stores the ParentStream in
+   ar->data by calling PL_get_stream(). This increases the reference
+   count for the stream; it's decremented by
+   PL_release_stream(ar->data).
+
+   When an EntryStream is created (by cffi_archive_open_entry/2) and a
    write is done on the stream, the following calls and callbacks
    happen for write (similar for read):
       prolog:write(EntryStream)
@@ -117,14 +133,16 @@ the archive, the current header and some state information.
    archive_write_close(). However, it's simpler to explicitly call it
    when closing the EntryStream.]
 
-   archive_close(Archive) calls archive_{read,write}_free(), which
-   calls archive_{read,write}_close(), which calls
-   libarchive_close_cb().
+   cffi_archive_close(Archive) calls save_archive_free(), which calls
+   archive_{read,write}_close(), which calls libarchive_close_cb().
 
    When the `ar` blob is released, it needs to free the
    archive_entry struct, close the entry stream (EntryStream),
    and close/release the archive ParentStream (ar->data).
- */
+
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+#define ARCHIVE_MAGIC 348184378
 
 typedef enum ar_status
 { AR_VIRGIN = 0,
@@ -163,12 +181,11 @@ ar_set_status_error(archive_wrapper *ar, int rc)
    Safe to call with ar->archive == NULL.
 */
 static int
-archive_read_or_write_free(archive_wrapper *ar)
+safe_archive_free(archive_wrapper *ar)
 { if ( !ar || ! ar->archive )
     return ARCHIVE_FATAL;
   { struct archive *archive_orig = ar->archive;
-    /* Prevent double free by first setting ar->archive = NULL. */
-    ar->archive = NULL;
+    ar->archive = NULL; /* Prevent double free through callbacks */
     /* TODO: this could use archive_free(archive_orig) */
     switch( ar->how )
     { case 'r': return archive_read_free(archive_orig);
@@ -198,7 +215,7 @@ static const char*
 ar_status_str(const archive_wrapper *ar)
 { if ( !ar )
     return "AR_(null)";
-  switch ( ar->status )
+  switch( ar->status )
   { case AR_VIRGIN:                     return "AR_VIRGIN";
     case AR_OPENED_ARCHIVE:             return "AR_OPENED_ARCHIVE";
     case AR_NEW_ENTRY:                  return "AR_NEW_ENTRY";
@@ -215,9 +232,9 @@ ar_status_str(const archive_wrapper *ar)
 static void
 ar_dbg(const char *msg, const archive_wrapper *ar)
 { if ( ar )
-  { Sdprintf("%-25s %p %p (%c) %-18s close_parent=%d symbol=%lu archive=%p entry=%p\n",
+  { Sdprintf("%-25s %p %p (%c) %-18s close_parent=%d symbol=%lu archive=%p entry=%p agc=%d\n",
 	     msg, ar, ar->data, ar->how, ar_status_str(ar),
-	     ar->close_parent, (long unsigned)ar->symbol, ar->archive, ar->entry);
+	     ar->close_parent, (long unsigned)ar->symbol, ar->archive, ar->entry, ar->agc);
     assert(ar->magic == ARCHIVE_MAGIC);
   } else
   { Sdprintf("%-25s %p\n", msg, ar);
@@ -358,7 +375,7 @@ ar_w_release_cb(atom_t symbol)
   */
 
   /* TODO: Can we throw an exception if the following fails? */
-  (void)archive_read_or_write_free(ar);
+  (void)safe_archive_free(ar);
 
   /* Only writeable archives have ar->entry allocated by archive_entry_new() */
   if (ar->how == 'w')
@@ -461,7 +478,7 @@ get_archive(term_t t, archive_wrapper **arp)
 		 *	      CALLBACKS		*
 		 *******************************/
 
-/* Callback from archive_XXX_close() or archive_XXX_free() */
+/* Callback from archive_XXX_close() or (indirectly) archive_XXX_free() */
 static int
 libarchive_close_cb(struct archive *a, void *cdata)
 { archive_wrapper *ar = cdata;
@@ -475,6 +492,26 @@ libarchive_close_cb(struct archive *a, void *cdata)
 static ssize_t
 libarchive_read_cb(struct archive *a, void *cdata, const void **buffer)
 { archive_wrapper *ar = cdata;
+  /* This callback is called in these contexts:
+     - from archive_read_open1() when status == AR_VIRGIN
+     - when getting next header: status == AR_OPENED_ARCHIVE
+     - from a Prolog read on an entry stream
+  */
+  switch( ar->status )
+  { case AR_ERROR:
+     Sdprintf("LIBARCHIVE_READ_CB(%c): %s\n", ar->how, ar_status_str(ar)); // DO NOT SUBMIT
+      return ar_set_status_error(ar, -1);
+    case AR_VIRGIN:
+    case AR_OPENED_ARCHIVE:
+    case AR_NEW_ENTRY:
+    case AR_OPENED_ENTRY:
+    case AR_OPENED_ENTRY_PENDING_CLOSE:
+      if ( ar->how  != 'r' )
+      { Sdprintf("LIBARCHIVE_READE_CB(%c): %s\n", ar->how, ar_status_str(ar)); // DO NOT SUBMIT
+        return ar_set_status_error(ar, -1);
+      }
+      break;
+  }
   /* In the following code, Sfeof() call S__fillbuff() if the buffer is empty.
      TODO: Why is the code written this way instead of using Sfread()?
 	   One reason could be that apparently libarchive doesn't
@@ -501,8 +538,23 @@ libarchive_read_cb(struct archive *a, void *cdata, const void **buffer)
 
 static ssize_t
 libarchive_write_cb(struct archive *a, void *cdata, const void *buffer, size_t n)
-{ const archive_wrapper *ar = cdata;
+{ archive_wrapper *ar = cdata;
   ar_dbg("LIBARCHIVE_WRITE_CB", ar);
+  switch( ar->status )
+  { case AR_VIRGIN:
+    case AR_ERROR:
+      ar_dbg("LIBARCHIVE_WRITE_CB/status", ar);
+      return ar_set_status_error(ar, -1);
+    case AR_OPENED_ARCHIVE: /* From close(EntryStream) and others */
+    case AR_NEW_ENTRY:
+    case AR_OPENED_ENTRY:
+    case AR_OPENED_ENTRY_PENDING_CLOSE:
+      if ( ar->how  != 'w' )
+      { ar_dbg("LIBARCHIVE_WRITE_CB/how", ar);
+        return ar_set_status_error(ar, -1);
+      }
+      break;
+  }
   return Sfwrite(buffer, 1, n, ar->data);
 }
 
@@ -510,6 +562,21 @@ static la_int64_t
 libarchive_skip_cb(struct archive *a, void *cdata, la_int64_t request)
 { archive_wrapper *ar = cdata;
   ar_dbg("LIBARCHIVE_SKIP_CB", ar);
+  switch( ar->status )
+  { case AR_VIRGIN:
+    case AR_OPENED_ENTRY:
+    case AR_OPENED_ENTRY_PENDING_CLOSE:
+    case AR_ERROR:
+      ar_dbg("LIBARCHIVE_SKIP_CB/status", ar);
+      return 0; /* cannot skip; library will read */
+    case AR_NEW_ENTRY:
+    case AR_OPENED_ARCHIVE:
+      if ( ar->how  != 'r' )
+      { ar_dbg("LIBARCHIVE_SKIP_CB/how", ar);
+        return ar_set_status_error(ar, -1);
+      }
+      break;
+  }
 
   if ( Sseek64(ar->data, request, SIO_SEEK_CUR) == 0 )
     return request;
@@ -523,6 +590,22 @@ static la_int64_t
 libarchive_seek_cb(struct archive *a, void *cdata, la_int64_t request, int whence)
 { archive_wrapper *ar = cdata;
   int s_whence;
+
+  switch( ar->status )
+  { case AR_NEW_ENTRY:
+    case AR_OPENED_ENTRY:
+    case AR_OPENED_ENTRY_PENDING_CLOSE:
+    case AR_ERROR:
+      ar_dbg("LIBARCHIVE_SEEK_CB/status", ar);
+      return ar_set_status_error(ar, -1);
+    case AR_VIRGIN: /* See comment in libarchive_read_cb */
+    case AR_OPENED_ARCHIVE:
+      if ( ar->how  != 'r' )
+      { ar_dbg("LIBARCHIVE_SEEK_CB/how", ar);
+        return ar_set_status_error(ar, -1);
+      }
+      break;
+  }
 
   switch (whence) {
     case SEEK_SET: s_whence=SIO_SEEK_SET; break;
@@ -546,11 +629,11 @@ libarchive_seek_cb(struct archive *a, void *cdata, la_int64_t request, int whenc
 		 *******************************/
 
 static int
-archive_error(const archive_wrapper *ar, int rc, term_t t, const char *msg)
+ar_error(const archive_wrapper *ar, int rc, term_t t, const char *msg)
 { int eno = ar->archive ? archive_errno(ar->archive) : 0;
   const char *s = ar->archive ? archive_error_string(ar->archive) : NULL;
   term_t ex;
-  ar_dbg("ARCHIVE_ERROR", ar);
+  ar_dbg("AR_ERROR", ar);
 
   if ( PL_exception(0) )
     return FALSE;
@@ -684,7 +767,7 @@ enable_type(archive_wrapper *ar, int type,
 }
 
 static foreign_t
-archive_open_stream(term_t data, term_t mode, term_t handle, term_t options)
+cffi_archive_open_stream(term_t data, term_t mode, term_t handle, term_t options)
 { archive_wrapper *ar;
   term_t tail = PL_copy_term_ref(options);
   term_t head = PL_new_term_ref();
@@ -713,6 +796,7 @@ archive_open_stream(term_t data, term_t mode, term_t handle, term_t options)
       /* PL_get_stream() must be before PL_unify_blob so that there's
 	 always a valid `data` field in the blob */
       if ( !PL_get_stream(data, &ar_local.data, flags) ||
+           // !(ar_local.data = PL_acquire_stream(ar_local.data)) || // DO NOT SUBMIT
 	   !PL_unify_blob(handle, &ar_local, sizeof ar_local, &archive_blob) ||
 	   !PL_get_atom_ex(handle, &a) )
 	return FALSE;
@@ -875,9 +959,7 @@ archive_open_stream(term_t data, term_t mode, term_t handle, term_t options)
       ar->type |= FILTER_ALL;
     if ( !(ar->type & FORMAT_MASK) )
       ar->type |= FORMAT_ALL;
-  }
-  if ( ar->how == 'r' )
-  { if ( !(ar->archive = archive_read_new()) )
+    if ( !(ar->archive = archive_read_new()) )
       return ar_set_status_error(ar, PL_resource_error("memory"));
 
      if ( (ar->type & FILTER_ALL) == FILTER_ALL )
@@ -986,7 +1068,7 @@ archive_open_stream(term_t data, term_t mode, term_t handle, term_t options)
        { ar->status = AR_OPENED_ARCHIVE;
 	 return TRUE;
       } else
-      { return ar_set_status_error(ar, archive_error(ar, rc, data, "archive_read_open1"));
+      { return ar_set_status_error(ar, ar_error(ar, rc, data, "archive_read_open1"));
       }
      }
   } else if ( ar->how == 'w' )
@@ -1057,7 +1139,7 @@ archive_open_stream(term_t data, term_t mode, term_t handle, term_t options)
        { ar->status = AR_OPENED_ARCHIVE;
 	 return TRUE;
        } else
-       { return ar_set_status_error(ar, archive_error(ar, rc, data, "archive_write_open"));
+       { return ar_set_status_error(ar, ar_error(ar, rc, data, "archive_write_open"));
        }
      }
   } else {
@@ -1068,7 +1150,7 @@ archive_open_stream(term_t data, term_t mode, term_t handle, term_t options)
 
 
 static foreign_t
-archive_property(term_t archive, term_t prop, term_t value)
+cffi_archive_property(term_t archive, term_t prop, term_t value)
 { archive_wrapper *ar;
   atom_t pn;
   const char *s;
@@ -1100,7 +1182,7 @@ archive_property(term_t archive, term_t prop, term_t value)
 
 
 static foreign_t
-archive_next_header(term_t archive, term_t name)
+cffi_archive_next_header(term_t archive, term_t name)
 { archive_wrapper *ar;
   int rc;
 
@@ -1139,7 +1221,7 @@ archive_next_header(term_t archive, term_t name)
   assert(ar->how == 'r');
   if ( ar->status == AR_NEW_ENTRY )
   { if ( (rc=archive_read_data_skip(ar->archive)) != ARCHIVE_OK )
-      return ar_set_status_error(ar, archive_error(ar, rc, archive, "archive_read_data_skip"));
+      return ar_set_status_error(ar, ar_error(ar, rc, archive, "archive_read_data_skip"));
   } else
     assert(ar->status == AR_OPENED_ARCHIVE);
 
@@ -1162,14 +1244,14 @@ archive_next_header(term_t archive, term_t name)
     return FALSE;			/* simply at the end */
   }
 
-  return ar_set_status_error(ar, archive_error(ar, rc, archive, "archive_read_next_header"));
+  return ar_set_status_error(ar, ar_error(ar, rc, archive, "archive_read_next_header"));
 }
 
 
 /* Called from archive_close() [Prolog archive_close/1] or
    ar_entry_close_cb() [Prolog close/1] */
 static int /* 0 for success, -1 for error */
-archive_close_(archive_wrapper *ar)
+cffi_archive_close_(archive_wrapper *ar)
 { int success = 0;
   ar_dbg("ARCHIVE_CLOSE_", ar);
   if ( !ar )
@@ -1200,9 +1282,9 @@ archive_close_(archive_wrapper *ar)
       return TRUE;
   }
 
-  /* archive_read_or_write_free() flushes the archive buffers, so must
+  /* safe_archive_free() flushes the archive buffers, so must
      be done while the ParentStream (ar->data) is still open. */
-  if ( archive_read_or_write_free(ar) != ARCHIVE_OK )
+  if ( safe_archive_free(ar) != ARCHIVE_OK )
   { errno = EFAULT;
     success = -1;
   }
@@ -1216,11 +1298,15 @@ archive_close_(archive_wrapper *ar)
   if ( ar->data )
   { IOSTREAM *ar_data_orig = ar->data;
     ar->data = NULL;
+    // Sdprintf("%-25s %p %p (%c) %-18s close_parent=%d symbol=%lu archive=%p entry=%p agc=%d\n", // DO NOT SUBMIT
+    //          "<PL_release_stream>", ar, ar->data, ar->how, ar_status_str(ar),
+    //          ar->close_parent, (long unsigned)ar->symbol, ar->archive, ar->entry, ar->agc);
     PL_release_stream(ar_data_orig);
 
     if ( ar->close_parent )
     { if ( Sgcclose(ar_data_orig, ar->agc ? SIO_CLOSE_FORCE : 0) != 0 )
-      { archive_set_error(ar->archive, errno, "Close failed");
+      { if ( ar->archive )
+          archive_set_error(ar->archive, errno, "Close failed");
 	success = -1;
       }
     }
@@ -1235,7 +1321,7 @@ archive_close_(archive_wrapper *ar)
 }
 
 static foreign_t
-archive_close(term_t archive)
+cffi_archive_close(term_t archive)
 { archive_wrapper *ar;
   if ( !get_archive(archive, &ar) )
   { ar_dbg("ARCHIVE_CLOSE", NULL);
@@ -1243,7 +1329,7 @@ archive_close(term_t archive)
   }
   ar_dbg("ARCHIVE_CLOSE", ar);
 
-  (void)archive_close_(ar);
+  (void)cffi_archive_close_(ar);
   if ( PL_exception(0) )
     PL_clear_exception();
 
@@ -1255,7 +1341,7 @@ archive_close(term_t archive)
 		 *******************************/
 
 static foreign_t
-archive_header_prop_(term_t archive, term_t field)
+cffi_archive_header_prop_(term_t archive, term_t field)
 { archive_wrapper *ar;
   functor_t prop;
 
@@ -1343,7 +1429,7 @@ archive_header_prop_(term_t archive, term_t field)
 }
 
 static foreign_t
-archive_set_header_property(term_t archive, term_t field)
+cffi_archive_set_header_property(term_t archive, term_t field)
 { archive_wrapper *ar;
   functor_t prop;
 
@@ -1502,7 +1588,7 @@ ar_entry_close_cb(void *handle)
   { case 'w':
       if ( ar->archive && ARCHIVE_OK != archive_write_finish_entry(ar->archive) )
       { ar->status = AR_ERROR;
-	/* TODO: PL_exception(0) and/or archive_error()? */
+	/* TODO: PL_exception(0) and/or ar_error()? */
 	success = -1;
       }
       break;
@@ -1515,7 +1601,7 @@ ar_entry_close_cb(void *handle)
     { /* Re-do archive_close(), this time as if the close(EntryStream)
 	 has been done. */
     ar->status = AR_OPENED_ARCHIVE;
-    success = archive_close_(ar);
+    success = cffi_archive_close_(ar);
   }
 
   ar_dbg("AR_ENTRY_CLOSE_CB/2", ar);
@@ -1563,7 +1649,7 @@ static IOFUNCTIONS ar_entry_write_functions =
 };
 
 static foreign_t
-archive_open_entry(term_t archive, term_t stream)
+cffi_archive_open_entry(term_t archive, term_t stream)
 { archive_wrapper *ar;
   IOSTREAM *entry_data;
 
@@ -1593,7 +1679,7 @@ archive_open_entry(term_t archive, term_t stream)
     { /* Finalize the header before trying to write the data */
       int rc = archive_write_header(ar->archive, ar->entry);
       if ( rc != ARCHIVE_OK )
-	return ar_set_status_error(ar, archive_error(ar, rc, archive, "archive_write_header"));
+	return ar_set_status_error(ar, ar_error(ar, rc, archive, "archive_write_header"));
       /* Then we can make a handle for the data */
       entry_data = Snew(ar, SIO_OUTPUT|SIO_RECORDPOS, &ar_entry_write_functions);
     }
@@ -1610,7 +1696,8 @@ archive_open_entry(term_t archive, term_t stream)
     }
 
     if ( Sgcclose(entry_data, ar->agc ? SIO_CLOSE_FORCE : 0) != 0 )
-    { archive_set_error(ar->archive, errno, "Close failed");
+    { if ( ar->archive )
+        archive_set_error(ar->archive, errno, "Close failed");
     }
     ar->status = AR_ERROR;
     return FALSE;
@@ -1682,11 +1769,11 @@ install_archive4pl(void)
   MKFUNCTOR(format,          1);
   MKFUNCTOR(permissions,     1);
 
-  PL_register_foreign("archive_open_stream",  4, archive_open_stream, 0);
-  PL_register_foreign("archive_property",     3, archive_property,    0);
-  PL_register_foreign("archive_close",        1, archive_close,       0);
-  PL_register_foreign("archive_next_header",  2, archive_next_header, 0);
-  PL_register_foreign("archive_header_prop_", 2, archive_header_prop_, 0);
-  PL_register_foreign("archive_set_header_property", 2, archive_set_header_property, 0);
-  PL_register_foreign("archive_open_entry",   2, archive_open_entry,  0);
+  PL_register_foreign("archive_open_stream",  4, cffi_archive_open_stream, 0);
+  PL_register_foreign("archive_property",     3, cffi_archive_property,    0);
+  PL_register_foreign("archive_close",        1, cffi_archive_close,       0);
+  PL_register_foreign("archive_next_header",  2, cffi_archive_next_header, 0);
+  PL_register_foreign("archive_header_prop_", 2, cffi_archive_header_prop_, 0);
+  PL_register_foreign("archive_set_header_property", 2, cffi_archive_set_header_property, 0);
+  PL_register_foreign("archive_open_entry",   2, cffi_archive_open_entry,  0);
 }

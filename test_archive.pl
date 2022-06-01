@@ -132,8 +132,7 @@ test(create_and_open_named_write,
     read_string(EntryStreamRead, _Len, ContentsRead),
     close(EntryStreamRead).
 
-% DO NOT SUBMIT - causes heap-use-after-free
-ytest(create_and_open_named_no_close, % same as above but without close/1
+test(create_and_open_named_no_close, % same as above but without close/1
      [ContentsRead1 == Contents1,
       setup(create_tmp_file(ArchivePath)),
       cleanup(delete_file(ArchivePath))]) :-
@@ -212,10 +211,7 @@ test(double_open_write,
     archive_open(ArchivePath, write, Archive, [format(zip)]),
     archive_open(ArchivePath, write, Archive, [format(zip)]).
 
-:- discontiguous zztest/2. % DO NOT SUBMIT
-% DO NOT SUBMIT: causes an infinite loop
-%   - or use-after-free on cleanup
-zztest(double_open_entry_write,
+test(double_open_entry_write,
      [error(permission_error('access-AR_OPENED_ENTRY(w)',archive_entry,Archive)),
       setup(create_tmp_file(ArchivePath)),
       cleanup(delete_file(ArchivePath))]) :-
@@ -226,15 +222,7 @@ zztest(double_open_entry_write,
     assertion(\+ stream_property(Stream1, input)),
     archive_open_entry(Archive, _Stream2).
 
-xxx(ArchivePath) :- % DO NOT SUBMIT
-    archive_open(ArchivePath, write, Archive, [format(zip)]),
-    archive_next_header(Archive, item1),
-    archive_open_entry(Archive, Stream1),
-    assertion(stream_property(Stream1, output)),
-    assertion(\+ stream_property(Stream1, input)),
-    archive_open_entry(Archive, _Stream2).
-
-zztest(double_next_header_write,
+test(double_next_header_write,
      [error(permission_error('next_header-AR_OPENED_ENTRY(w)',archive,Archive)),
       setup(create_tmp_file(ArchivePath)),
       cleanup(delete_file(ArchivePath))]) :-
@@ -351,7 +339,9 @@ test(close_parent2,
     archive_close(Archive),
     assertion(\+ is_stream(Stream)).
 
-zztest(close_parent3,
+% DO NOT SUBMIT - no error??? - if two close's on a single stream that
+%  had been "dup"ed with Snew(), then only the 2nd one takes effect?
+test(close_parent3,
      [error(archive_error(_,fatal,Archive,archive_free)),
       setup(create_tmp_file(ArchivePath)),
       cleanup(delete_file(ArchivePath))]) :-
@@ -430,32 +420,14 @@ test(no_next_header,
     archive_open(Stream, read, Archive, [close_parent(false)]),
     archive_open_entry(Archive, Example).
 
-test(gc) :- % Run this last, to isolate PL_cleanup() problems TODO: remove this test
+ytest(gc) :- % Run this last, to isolate PL_cleanup() problems TODO: remove this test
+    garbage_collect,
     garbage_collect,
     garbage_collect_atoms,
-    garbage_collect_atoms.
+    garbage_collect_atoms,
+    garbage_collect.
 
 :- end_tests(archive).
-
-:- begin_tests(debug, % TODO: Remove this once asan memory bugs have
-                      %       been fixed Also remove
-                      %       archive_open_named_debug/3.
-               [setup(disable_gc),
-                cleanup(disable_gc)]).
-
-test(memleak) :- % DO NOT SUBMIT: This seems to work now
-    ArchivePath= '/tmp/ar_test.zip', % requires setting up manually
-    format(user_error, '~n', []),
-    (   archive_open_named_debug(ArchivePath, 'XXX', _TestArchiveStream)
-    *-> format(user_error, '*** memleak test - Should have failed!!!~n', [])
-    ;   format(user_error, '*** memleak test - about to garbage collect(1)~n', []),
-        garbage_collect,
-        garbage_collect_atoms,
-        format(user_error, '*** memleak test - about to garbage collect(2)~n', []),
-        garbage_collect_atoms
-    ).
-
-:- end_tests(debug).
 
 disable_gc :-
     set_prolog_flag(agc_margin,0), % turn off gc
